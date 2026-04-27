@@ -24,39 +24,90 @@ import (
 	cnfibertest "github.com/evstack/ev-node/tools/celestia-node-fiber/testing"
 )
 
-// TestEvNode_FiberDA_Perf measures end-to-end throughput and latency of
-// ev-node's DA submission pipeline against a real Fibre adapter. It is
-// intentionally simple — pump txs at a fixed rate for a fixed duration,
-// listen on the data namespace, and report aggregate numbers.
+// perfConfig parametrizes the perf benchmark. Each test wires up its own
+// config and calls runFiberPerfTest below; the helper does the actual
+// chain setup, pump, and recording.
+type perfConfig struct {
+	label        string        // PERF: line prefix used for grep'ing CI output
+	txSize       int           // bytes per injected tx
+	txsPerTick   int           // txs injected per pumpInterval
+	pumpInterval time.Duration // ticker period
+	runDuration  time.Duration // total pump window
+}
+
+// pumpRateMBps returns the configured input rate in MiB/s.
+func (c perfConfig) pumpRateMBps() float64 {
+	bps := float64(c.txSize*c.txsPerTick) / c.pumpInterval.Seconds()
+	return bps / (1024 * 1024)
+}
+
+// TestEvNode_FiberDA_Perf is the moderate-rate perf benchmark used as the
+// baseline for before/after comparisons on fibre-experiment. It pumps
+// ~10 MiB/s of 10 KiB txs for 30 s.
 //
-// The test prints a single machine-parseable PERF: line at the end so a
-// before/after diff (e.g. captured on fibre-experiment HEAD vs. HEAD~N)
-// can be eyeballed or scripted. It does NOT make hard pass/fail
-// assertions on numbers — it only fails on operational errors (node
-// panics, no events received, etc.) so the absolute numbers can vary
-// across machines without breaking CI.
-//
-// To run only this test:
+// Run with:
 //
 //	cd tools/celestia-node-fiber
-//	go test -tags fibre -timeout 5m -v -run TestEvNode_FiberDA_Perf ./testing/
-//
-// Use -short to skip (the chain + bridge spinup is ~30s).
+//	go test -tags fibre -timeout 6m -v -run TestEvNode_FiberDA_Perf$ ./testing/
 func TestEvNode_FiberDA_Perf(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf benchmark skipped in short mode")
 	}
+	runFiberPerfTest(t, perfConfig{
+		label:        "PERF",
+		txSize:       10 * 1024,
+		txsPerTick:   100,
+		pumpInterval: 100 * time.Millisecond,
+		runDuration:  30 * time.Second,
+	})
+}
 
-	// Tunables. Sized so a default-build (5 MiB DefaultMaxBlobSize) ev-node
-	// can keep up: per-block data ≈ 100 txs × 10 KiB = 1 MiB, well under
-	// the 5 MiB cap. Scale up txSize/txsPerTick after rebuilding with the
-	// 128 MiB ldflag.
-	const (
-		txSize       = 10 * 1024              // 10 KiB per tx
-		txsPerTick   = 100                    // 100 txs per pump tick
-		pumpInterval = 100 * time.Millisecond // → 1000 txs/s = 10 MiB/s input
-		runDuration  = 30 * time.Second
-	)
+// TestEvNode_FiberDA_Perf_Hyper pumps ~100 MiB/s of 10 KiB txs for 30 s
+// (10 000 txs/s). 10 KiB matches an EVM-shaped tx; 100 KiB at the same
+// MiB/s makes block production (marshal + sign + store) the bottleneck
+// — observed during early hyper runs that produced only 1.4 blocks/s
+// vs. the 5 blocks/s the BlockTime asks for.
+//
+// At 10 KiB × 10 000/s the per-block math is:
+//
+//	scrape  (100 ms) → 1000 txs × 10 KiB = ~10 MiB
+//	block   (200 ms) → 2 scrapes        = ~20 MiB
+//	5 blocks/s × ~20 MiB = 100 MiB/s of block-data production
+//	submitter @ 1.5 s adaptive → 7–8 blocks × 20 MiB ≈ 140 MiB pending
+//	→ trips the 96 MiB threshold; 4 concurrent workers ship in parallel
+//
+// So this configuration should saturate the post-fix DA pipeline
+// without starving block production.
+//
+// Escrow draw at this rate ≈ 70 TIA — well within the test network's
+// 50 000 TIA escrow.
+//
+//	go test -tags fibre -timeout 6m -v -run TestEvNode_FiberDA_Perf_Hyper ./testing/
+func TestEvNode_FiberDA_Perf_Hyper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("hyper perf benchmark skipped in short mode")
+	}
+	runFiberPerfTest(t, perfConfig{
+		label:        "PERF_HYPER",
+		txSize:       10 * 1024,
+		txsPerTick:   1000,
+		pumpInterval: 100 * time.Millisecond,
+		runDuration:  30 * time.Second,
+	})
+}
+
+// runFiberPerfTest stands up the chain + bridge + adapter, wires an
+// ev-node aggregator pointed at the adapter, and pumps txs at the
+// configured rate while recording BlobEvents from the data namespace.
+// Prints a single machine-parseable "<label>: ..." line at the end.
+//
+// No hard pass/fail on numbers — only on operational errors (no events
+// received, blocks not produced, node panic). Absolute throughput is
+// machine-dependent.
+func runFiberPerfTest(t *testing.T, cfg perfConfig) {
+	t.Helper()
+	t.Logf("starting perf run: label=%s tx_size=%d txs_per_tick=%d pump_interval=%s run_duration=%s target_pump_mb_s=%.2f",
+		cfg.label, cfg.txSize, cfg.txsPerTick, cfg.pumpInterval, cfg.runDuration, cfg.pumpRateMBps())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	t.Cleanup(cancel)
@@ -107,8 +158,6 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 		nodeErrCh <- rollnode.Run(nodeCtx)
 	}()
 
-	// Wait until the node has produced at least one block before starting
-	// the pump — keeps the start-of-run timing free of node-spinup noise.
 	require.Eventually(t, func() bool {
 		return exec.Stats().BlocksProduced >= 1
 	}, 60*time.Second, 200*time.Millisecond, "node should produce its first block")
@@ -116,46 +165,55 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 	startBlocks := exec.Stats().BlocksProduced
 	startTxs := exec.Stats().TotalExecutedTxs
 
-	// Pump goroutine: inject txs at a fixed rate for runDuration.
-	// Tx layout: 8-byte sequence number + 8-byte unix-nano emit time +
-	// random padding. The seq number gives the recorder a way to detect
-	// drops; the timestamp would let a future, more thorough latency
-	// breakdown attribute time spent in mempool vs. in-flight to DA.
+	// Pre-generate a randomness pool sized for several txs. Sampling
+	// from offsets within a fixed pool keeps the pump's CPU off the
+	// CSPRNG hot path at high tx sizes — at 100 MiB/s, calling
+	// rand.Read per tx becomes a measurable bottleneck.
+	pool := make([]byte, max(8*cfg.txSize, 1<<20))
+	if _, err := rand.Read(pool); err != nil {
+		t.Fatalf("seeding random pool: %v", err)
+	}
+
 	var (
 		injectedCount atomic.Uint64
 		injectedBytes atomic.Uint64
 	)
 
 	pumpStart := time.Now()
-	pumpDeadline := pumpStart.Add(runDuration)
+	pumpDeadline := pumpStart.Add(cfg.runDuration)
 
 	pumpWg := sync.WaitGroup{}
 	pumpWg.Add(1)
 	go func() {
 		defer pumpWg.Done()
-		ticker := time.NewTicker(pumpInterval)
+		ticker := time.NewTicker(cfg.pumpInterval)
 		defer ticker.Stop()
 		var seq uint64
-		buf := make([]byte, txSize)
+		poolLen := len(pool)
 		for {
 			now := time.Now()
 			if !now.Before(pumpDeadline) {
 				return
 			}
-			for range txsPerTick {
+			for range cfg.txsPerTick {
 				seq++
-				binary.BigEndian.PutUint64(buf, seq)
-				binary.BigEndian.PutUint64(buf[8:], uint64(now.UnixNano()))
-				// Random padding so blob compressors (if any) don't get a
-				// free ride and skew throughput numbers.
-				if _, err := rand.Read(buf[16:]); err != nil {
-					t.Logf("rand.Read failed (ignored): %v", err)
+				// Each tx is a fresh slice so the executor's channel
+				// can hold ownership without aliasing. The first 16
+				// bytes are seq + emit-time so a future receiver can
+				// reconstruct ordering or measure mempool latency;
+				// the rest is sampled from the random pool — cheaper
+				// than calling rand.Read per tx.
+				cp := make([]byte, cfg.txSize)
+				binary.BigEndian.PutUint64(cp, seq)
+				binary.BigEndian.PutUint64(cp[8:], uint64(now.UnixNano()))
+				offset := int(seq*7919) % (poolLen - cfg.txSize + 16)
+				if offset < 0 {
+					offset = 0
 				}
-				cp := make([]byte, txSize)
-				copy(cp, buf)
+				copy(cp[16:], pool[offset:offset+cfg.txSize-16])
 				exec.InjectTx(cp)
 				injectedCount.Add(1)
-				injectedBytes.Add(uint64(txSize))
+				injectedBytes.Add(uint64(cfg.txSize))
 			}
 			select {
 			case <-ticker.C:
@@ -165,7 +223,6 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 		}
 	}()
 
-	// Recorder goroutine: drain BlobEvents and timestamp them.
 	type blobReceipt struct {
 		recvAt   time.Time
 		dataSize uint64
@@ -197,21 +254,24 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 		}
 	}()
 
-	// Wait for the pump to finish.
 	pumpWg.Wait()
 	pumpEnd := time.Now()
 
-	// Drain phase: keep listening for ~3× the DA poll cadence past the
-	// last injected tx so in-flight uploads have time to land. Stop early
-	// if the inclusion height catches up with the block height.
-	const drainTimeout = 30 * time.Second
+	// Drain phase: keep listening past the last injected tx so in-
+	// flight uploads have time to land. The Fibre testnode batches PFF
+	// settlements and the BlobEvent delivery cadence can be ~10 s
+	// between events under load, so the "no new events" early-exit
+	// uses a generous 20 s window to avoid clipping the tail.
+	const (
+		drainTimeout = 90 * time.Second
+		stableWindow = 20 * time.Second
+	)
 	drainDeadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(drainDeadline) {
-		// crude liveness check: if no new receipts in a 5s window, stop.
 		receiptsMu.Lock()
 		nReceipts := len(receipts)
 		receiptsMu.Unlock()
-		time.Sleep(2 * time.Second)
+		time.Sleep(stableWindow)
 		receiptsMu.Lock()
 		if len(receipts) == nReceipts {
 			receiptsMu.Unlock()
@@ -220,11 +280,9 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 		receiptsMu.Unlock()
 	}
 
-	// Stop the node and recorder.
 	nodeCancel()
 	select {
 	case err := <-nodeErrCh:
-		// context.Canceled is the expected exit reason after nodeCancel().
 		if err != nil && err != context.Canceled {
 			t.Logf("node Run returned: %v", err)
 		}
@@ -251,7 +309,6 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 	pumpedMB := float64(injectedBytes.Load()) / (1024 * 1024)
 	pumpRateMBps := pumpedMB / wallTime.Seconds()
 
-	// Inter-arrival times of BlobEvents — proxy for upload+settle cadence.
 	sort.Slice(finalReceipts, func(i, j int) bool {
 		return finalReceipts[i].recvAt.Before(finalReceipts[j].recvAt)
 	})
@@ -261,18 +318,18 @@ func TestEvNode_FiberDA_Perf(t *testing.T) {
 	}
 	gapP50, gapP99 := percentile(gaps, 0.50), percentile(gaps, 0.99)
 
-	// Single, machine-parseable result line. grep "PERF:" in CI output.
-	t.Logf("PERF: blocks=%d txs_executed=%d injected_txs=%d injected_mb=%.2f pump_rate_mb_s=%.2f "+
+	txsPerSec := float64(txsExecuted) / wallTime.Seconds()
+
+	t.Logf("%s: blocks=%d txs_executed=%d txs_per_sec=%.0f injected_txs=%d injected_mb=%.2f pump_rate_mb_s=%.2f "+
 		"da_blobs=%d da_total_mb=%.2f da_throughput_mb_s=%.2f wall_s=%.2f gap_p50_s=%.3f gap_p99_s=%.3f",
-		blocksProduced, txsExecuted, injectedCount.Load(), pumpedMB, pumpRateMBps,
+		cfg.label, blocksProduced, txsExecuted, txsPerSec, injectedCount.Load(), pumpedMB, pumpRateMBps,
 		len(finalReceipts), float64(totalDABytes)/(1024*1024), throughputMBps, wallTime.Seconds(),
 		gapP50, gapP99)
 
-	// Sanity: the system should have moved at least *some* bytes through.
 	require.Greater(t, totalDABytes, uint64(0), "no DA bytes received via Fiber")
 	require.Greater(t, blocksProduced, uint64(0), "no blocks produced during pump window")
 
-	_ = block.FiberBlobEvent{} // keep block import alive in case the recorder branch is trimmed
+	_ = block.FiberBlobEvent{} // keep block import alive
 }
 
 func percentile(xs []float64, p float64) float64 {

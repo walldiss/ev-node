@@ -331,21 +331,15 @@ func (s *DASubmitter) runNamespaceWorker(ctx context.Context, ch chan *batchGrou
 			})
 			done <- struct{}{}
 			return
-		case first := <-ch:
-			groups := []*batchGroup{first}
-		drainLoop:
-			for {
-				select {
-				case g := <-ch:
-					if g != nil {
-						groups = append(groups, g)
-					}
-				default:
-					break drainLoop
-				}
-			}
-			s.logger.Debug().Str("itemType", itemType).Int("groups", len(groups)).Msg("worker processing batch")
-			s.processBatchSafe(ctx, groups, itemType, namespace)
+		case g := <-ch:
+			// One batchGroup per processBatch call. Merging multiple
+			// queued groups into one upload (the previous behaviour)
+			// is incompatible with multi-worker parallelism: it lets a
+			// single worker swallow the whole queue and starves the
+			// others. SubmitHeaders/SubmitData already pre-chunk by
+			// per-blob size, so each group corresponds to ~1 upload.
+			s.logger.Debug().Str("itemType", itemType).Msg("worker processing batch")
+			s.processBatchSafe(ctx, []*batchGroup{g}, itemType, namespace)
 			s.logger.Debug().Str("itemType", itemType).Msg("worker done processing batch")
 		}
 	}
@@ -592,6 +586,50 @@ func limitBatchBySizeBytes(marshaled [][]byte, maxBytes uint64) ([][]byte, bool)
 	return marshaled[:count], false
 }
 
+// splitByBlobSize partitions marshaled into greedy [start, end) chunks
+// where each chunk's total bytes ≤ maxBytes. Used by SubmitHeaders and
+// SubmitData to pre-chunk a large pending window into one batchGroup
+// per upload, so the per-stream worker pool can run them in parallel
+// instead of one worker swallowing the whole window.
+//
+// Items that individually exceed maxBytes still produce a chunk
+// containing only that item; processBatch surfaces it as the
+// "single item exceeds DA blob size" critical error path.
+func splitByBlobSize(marshaled [][]byte, maxBytes uint64) [][2]int {
+	if len(marshaled) == 0 || maxBytes == 0 {
+		return nil
+	}
+	var chunks [][2]int
+	start := 0
+	total := uint64(0)
+	for i, b := range marshaled {
+		sz := uint64(len(b))
+		// Force a single-item chunk for oversized items so the caller
+		// can react with a clean error rather than dragging neighbours
+		// into the same failed upload.
+		if sz > maxBytes {
+			if start < i {
+				chunks = append(chunks, [2]int{start, i})
+			}
+			chunks = append(chunks, [2]int{i, i + 1})
+			start = i + 1
+			total = 0
+			continue
+		}
+		if total+sz > maxBytes {
+			chunks = append(chunks, [2]int{start, i})
+			start = i
+			total = sz
+			continue
+		}
+		total += sz
+	}
+	if start < len(marshaled) {
+		chunks = append(chunks, [2]int{start, len(marshaled)})
+	}
+	return chunks
+}
+
 func (s *DASubmitter) recordFailure(reason common.DASubmitterFailureReason) {
 	counter, ok := s.metrics.DASubmitterFailures[reason]
 	if !ok {
@@ -628,25 +666,33 @@ func (s *DASubmitter) SubmitHeaders(ctx context.Context, headers []*types.Signed
 
 	postSubmit := s.makeHeaderPostSubmit(ctx, cache)
 
-	s.headerSubmitCh <- &batchGroup{
-		marshaled: envelopes,
-		onSuccess: func(count int, daHeight uint64) {
-			if count > 0 {
-				postSubmit(headers[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
-			}
-		},
-		makeRemaining: func(submittedCount int, remainingMarshaled [][]byte) *batchGroup {
-			remainingHeaders := headers[submittedCount:]
-			return &batchGroup{
-				marshaled: remainingMarshaled,
-				onSuccess: func(count int, daHeight uint64) {
-					if count > 0 {
-						postSubmit(remainingHeaders[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
-					}
-				},
-				makeRemaining: nil,
-			}
-		},
+	// Pre-chunk by per-blob size cap so each batchGroup sized for one
+	// fiber.Upload gets queued separately. Multiple chunks can then be
+	// picked up by independent workers and uploaded in parallel.
+	chunks := splitByBlobSize(envelopes, common.DefaultMaxBlobSize)
+	for _, span := range chunks {
+		chunkHeaders := headers[span[0]:span[1]]
+		chunkEnvelopes := envelopes[span[0]:span[1]]
+		s.headerSubmitCh <- &batchGroup{
+			marshaled: chunkEnvelopes,
+			onSuccess: func(count int, daHeight uint64) {
+				if count > 0 {
+					postSubmit(chunkHeaders[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
+				}
+			},
+			makeRemaining: func(submittedCount int, remainingMarshaled [][]byte) *batchGroup {
+				remainingHeaders := chunkHeaders[submittedCount:]
+				return &batchGroup{
+					marshaled: remainingMarshaled,
+					onSuccess: func(count int, daHeight uint64) {
+						if count > 0 {
+							postSubmit(remainingHeaders[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
+						}
+					},
+					makeRemaining: nil,
+				}
+			},
+		}
 	}
 	return nil
 }
@@ -844,25 +890,30 @@ func (s *DASubmitter) SubmitData(ctx context.Context, unsignedDataList []*types.
 
 	postSubmit := s.makeDataPostSubmit(ctx, cache)
 
-	s.dataSubmitCh <- &batchGroup{
-		marshaled: signedDataListBz,
-		onSuccess: func(count int, daHeight uint64) {
-			if count > 0 {
-				postSubmit(signedDataList[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
-			}
-		},
-		makeRemaining: func(submittedCount int, remainingMarshaled [][]byte) *batchGroup {
-			remainingData := signedDataList[submittedCount:]
-			return &batchGroup{
-				marshaled: remainingMarshaled,
-				onSuccess: func(count int, daHeight uint64) {
-					if count > 0 {
-						postSubmit(remainingData[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
-					}
-				},
-				makeRemaining: nil,
-			}
-		},
+	chunks := splitByBlobSize(signedDataListBz, common.DefaultMaxBlobSize)
+	for _, span := range chunks {
+		chunkData := signedDataList[span[0]:span[1]]
+		chunkBz := signedDataListBz[span[0]:span[1]]
+		s.dataSubmitCh <- &batchGroup{
+			marshaled: chunkBz,
+			onSuccess: func(count int, daHeight uint64) {
+				if count > 0 {
+					postSubmit(chunkData[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
+				}
+			},
+			makeRemaining: func(submittedCount int, remainingMarshaled [][]byte) *batchGroup {
+				remainingData := chunkData[submittedCount:]
+				return &batchGroup{
+					marshaled: remainingMarshaled,
+					onSuccess: func(count int, daHeight uint64) {
+						if count > 0 {
+							postSubmit(remainingData[:count], &datypes.ResultSubmit{BaseResult: datypes.BaseResult{Code: datypes.StatusSuccess, SubmittedCount: uint64(count), Height: daHeight}})
+						}
+					},
+					makeRemaining: nil,
+				}
+			},
+		}
 	}
 	return nil
 }

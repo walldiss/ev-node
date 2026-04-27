@@ -160,11 +160,17 @@ func newInMemExecutor() *inMemExecutor {
 	}
 }
 
+// InjectTx pushes a tx into the executor's mempool channel, blocking if
+// the buffer is full. The previous select+default form silently dropped
+// txs under load — fine for the showcase test (a single tx) but a lie
+// for the perf benchmarks (100s/s of injects), where the dropped count
+// looked like throughput.
+//
+// Blocking makes the pump self-throttle to the executor's actual
+// drain rate, so injected_mb / wall_s on the perf line reports real
+// ingestion throughput rather than attempted injects.
 func (e *inMemExecutor) InjectTx(tx []byte) {
-	select {
-	case e.txChan <- tx:
-	default:
-	}
+	e.txChan <- tx
 }
 
 type execStats struct {
