@@ -137,6 +137,18 @@ func generateCmd() *cobra.Command {
 				}
 			}
 
+			// Stage bridge payload: celestia-node binary + genesis + init
+			// script. Each bridge points at validator-0's RPC for header
+			// sync; talis up has already populated cfg.Validators[0].PublicIP.
+			if len(cfg.Bridges) > 0 {
+				if len(cfg.Validators) == 0 {
+					return fmt.Errorf("bridges configured but no validators — bring up validators first")
+				}
+				if err := stageBridgePayload(rootDir, payloadDir, nodeBinaryPath, buildDirPath, cfg); err != nil {
+					return fmt.Errorf("failed to stage bridge payload: %w", err)
+				}
+			}
+
 			return cfg.Save(rootDir)
 		},
 	}
@@ -293,6 +305,128 @@ func stageEncoderPayload(rootDir, payloadDir, appBinaryPath, fibreTxsimBinaryPat
 
 	// Write the encoder init script
 	return writeEncoderInitScript(filepath.Join(encPayload, "encoder_init.sh"))
+}
+
+// stageBridgePayload copies the celestia-node binary, the consensus
+// chain's genesis.json, and a templated bridge_init.sh into a
+// bridge-payload directory. Deploy uses this to ship a lightweight tar
+// to each bridge instance. The first validator's public IP is baked
+// into the init script as core.ip — bridges follow validator-0 for
+// header / block sync. With a multi-validator chain, validator-0 is a
+// fine choice since headers come from consensus regardless.
+func stageBridgePayload(rootDir, payloadDir, nodeBinaryPath, buildDirPath string, cfg Config) error {
+	bridgePayload := filepath.Join(rootDir, "bridge-payload")
+
+	if err := os.RemoveAll(bridgePayload); err != nil {
+		return fmt.Errorf("clean old bridge-payload: %w", err)
+	}
+
+	bridgeBuild := filepath.Join(bridgePayload, "build")
+	if err := os.MkdirAll(bridgeBuild, 0o755); err != nil {
+		return err
+	}
+
+	// celestia-node's binary is named "celestia". --build-dir wins over
+	// the per-binary path so a single packed dir can drive validator +
+	// bridge + ev-node deploys.
+	if buildDirPath != "" {
+		src := filepath.Join(buildDirPath, "celestia")
+		if err := copyFile(src, filepath.Join(bridgeBuild, "celestia"), 0o755); err != nil {
+			return fmt.Errorf("copy celestia from build dir: %w", err)
+		}
+	} else {
+		if err := copyFile(nodeBinaryPath, filepath.Join(bridgeBuild, "celestia"), 0o755); err != nil {
+			return fmt.Errorf("copy celestia binary: %w", err)
+		}
+	}
+
+	if err := copyFile(filepath.Join(payloadDir, "genesis.json"), filepath.Join(bridgePayload, "genesis.json"), 0o644); err != nil {
+		return fmt.Errorf("copy genesis.json: %w", err)
+	}
+	if err := copyFile(filepath.Join(payloadDir, "vars.sh"), filepath.Join(bridgePayload, "vars.sh"), 0o755); err != nil {
+		return fmt.Errorf("copy vars.sh: %w", err)
+	}
+
+	coreIP := cfg.Validators[0].PublicIP
+	if coreIP == "" || coreIP == "TBD" {
+		return fmt.Errorf("validator-0 has no public IP yet — run `talis up` before genesis")
+	}
+
+	return writeBridgeInitScript(filepath.Join(bridgePayload, "bridge_init.sh"), coreIP)
+}
+
+// writeBridgeInitScript writes the per-bridge init script. It runs
+// `celestia bridge init`, points the bridge at validator-0's gRPC for
+// state sync, generates an admin JWT (printed to a known file so
+// downstream ev-node deploys can scp it), and starts the bridge in a
+// detached tmux session.
+//
+// All values that change per-experiment are baked in at staging time.
+// CHAIN_ID comes from sourced vars.sh; coreIP is templated literally
+// since it's only known after talis up has populated config.json.
+func writeBridgeInitScript(path string, coreIP string) error {
+	script := `#!/bin/bash
+set -euo pipefail
+
+CELES_BRIDGE_HOME="$HOME/.celestia-bridge"
+CORE_IP="` + coreIP + `"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install curl jq chrony tmux --yes -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+systemctl enable chrony
+systemctl start chrony
+
+# TCP BBR — same tuning as validators / encoders.
+modprobe tcp_bbr || true
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+# Install celestia-node binary
+cp bridge-payload/build/celestia /bin/celestia
+chmod +x /bin/celestia
+
+source bridge-payload/vars.sh
+echo "Bridge bootstrap: chain_id=$CHAIN_ID core_ip=$CORE_IP"
+
+# Initialize node store. p2p.network is the chain id used for
+# topic namespacing; idempotent if the store already exists.
+if [ ! -f "$CELES_BRIDGE_HOME/config.toml" ]; then
+  celestia bridge init --p2p.network "$CHAIN_ID" --node.store "$CELES_BRIDGE_HOME"
+fi
+
+# Drop the consensus chain's genesis next to the bridge config so
+# anything that reads it (peer discovery, header validation) sees
+# the same genesis as validators.
+mkdir -p "$CELES_BRIDGE_HOME/config"
+cp bridge-payload/genesis.json "$CELES_BRIDGE_HOME/genesis.json"
+
+# Generate the admin JWT and stash it where downstream consumers
+# (ev-node deploy) can scp it.
+celestia bridge auth admin --node.store "$CELES_BRIDGE_HOME" > /root/bridge-jwt.txt
+echo "Wrote /root/bridge-jwt.txt"
+
+ufw allow 26658/tcp || true   # RPC (admin API)
+ufw allow 2121/tcp  || true   # P2P
+ufw allow 2121/udp  || true
+
+# Run in tmux so the SSH session can detach. RPC is exposed on
+# 0.0.0.0:26658 (auth required via JWT). Core gRPC connection to
+# validator-0 is plaintext for testnet.
+tmux kill-session -t bridge 2>/dev/null || true
+tmux new-session -d -s bridge "celestia bridge start \
+  --p2p.network ${CHAIN_ID} \
+  --node.store ${CELES_BRIDGE_HOME} \
+  --core.ip ${CORE_IP} \
+  --core.tls=false \
+  --rpc.addr 0.0.0.0 \
+  --rpc.port 26658 \
+  --metrics 2>&1 | tee -a /root/bridge.log"
+
+echo "Bridge started in tmux session 'bridge' — attach with: tmux attach -t bridge"
+`
+	return os.WriteFile(path, []byte(script), 0o755)
 }
 
 // writeEncoderInitScript creates a minimal init script for encoder instances.

@@ -133,7 +133,10 @@ func deployCmd() *cobra.Command {
 				if err := deployObservabilityIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload); err != nil {
 					return err
 				}
-				return deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+				if err := deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+					return err
+				}
+				return deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 			}
 			if err := deployPayloadViaS3(cmd.Context(), rootDir, cfg.Validators, tarPath, SSHKeyPath, "/root", "payload/validator_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
 				if !ignoreFailed {
@@ -144,7 +147,10 @@ func deployCmd() *cobra.Command {
 			if err := deployObservabilityIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload); err != nil {
 				return err
 			}
-			return deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+			if err := deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+				return err
+			}
+			return deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 		},
 	}
 
@@ -191,6 +197,43 @@ func deployObservabilityIfConfigured(ctx context.Context, cfg Config, rootDir, s
 	}
 
 	printGrafanaInfo(observabilityNode, rootDir)
+	return nil
+}
+
+// deployBridgesIfConfigured tars the bridge-payload directory (celestia
+// binary + genesis + bridge_init.sh) and ships it to each bridge
+// instance. The init script then runs `celestia bridge init/start` in
+// a tmux session and generates a JWT to /root/bridge-jwt.txt.
+func deployBridgesIfConfigured(ctx context.Context, cfg Config, rootDir, sshKeyPath string, directUpload bool, workers int) error {
+	if len(cfg.Bridges) == 0 {
+		return nil
+	}
+
+	bridgePayloadDir := filepath.Join(rootDir, "bridge-payload")
+	if _, err := os.Stat(bridgePayloadDir); os.IsNotExist(err) {
+		return fmt.Errorf("bridge-payload directory not found — run 'talis genesis' first")
+	}
+
+	bridgeTarPath := filepath.Join(rootDir, "bridge-payload.tar.gz")
+	log.Printf("Compressing bridge payload to %s\n", bridgeTarPath)
+	tarCmd := exec.Command("tar", "-czf", bridgeTarPath, "-C", rootDir, "bridge-payload")
+	tarCmd.Env = append(os.Environ(), "COPYFILE_DISABLE=1")
+	if output, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to compress bridge payload: %w, output: %s", err, string(output))
+	}
+	log.Printf("Sending bridge payload to %d bridge(s)...\n", len(cfg.Bridges))
+
+	if directUpload {
+		if err := deployPayloadDirect(cfg.Bridges, bridgeTarPath, sshKeyPath, "/root", "bridge-payload/bridge_init.sh", 7*time.Minute, workers); err != nil {
+			return fmt.Errorf("bridge deployment: %w", err)
+		}
+	} else {
+		if err := deployPayloadViaS3(ctx, rootDir, cfg.Bridges, bridgeTarPath, sshKeyPath, "/root", "bridge-payload/bridge_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
+			return fmt.Errorf("bridge deployment: %w", err)
+		}
+	}
+
+	log.Printf("Bridge deployment complete\n")
 	return nil
 }
 
