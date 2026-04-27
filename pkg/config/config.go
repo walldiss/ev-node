@@ -379,11 +379,16 @@ func (c *Config) ApplyFiberDefaults() {
 	// Drop to 1 s so inclusion-height tracking and metrics keep pace.
 	c.DA.BlockTime = DurationWrapper{Duration: 1 * time.Second}
 
-	// Bound the pending cache so a transient Fibre stall doesn't grow
-	// memory + store unboundedly. 200 ≈ 40 s of headroom at 5 blocks/s.
-	if c.Node.MaxPendingHeadersAndData == 0 {
-		c.Node.MaxPendingHeadersAndData = 200
-	}
+	// MaxPendingHeadersAndData = 0 (no limit) for Fiber. Block
+	// production must never gate on DA submission latency — if Fibre
+	// stalls, the executor keeps producing and the cache grows
+	// unbounded until DA catches up. A finite cap (the previous 200)
+	// halts block production for tens of seconds during any Fibre
+	// slowdown, which contradicts the experiment's "execution never
+	// blocks on uploads" invariant. Trade-off: memory grows linearly
+	// with the stall duration. Override explicitly if you want
+	// backpressure.
+	c.Node.MaxPendingHeadersAndData = 0
 }
 
 // GetNamespace returns the namespace for header submissions.

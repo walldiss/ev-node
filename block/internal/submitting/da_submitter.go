@@ -34,7 +34,15 @@ const (
 	// Ed25519 signing is CPU-bound, so we use GOMAXPROCS workers.
 	signingWorkerPoolSize = 0 // 0 means use runtime.GOMAXPROCS(0)
 
-	submitQueueSize = 256
+	// submitQueueSize is the buffered capacity of headerSubmitCh and
+	// dataSubmitCh. Sized so the daSubmissionLoop's enqueue effectively
+	// never blocks even during a sustained Fibre stall: 10240 entries ×
+	// ~100 bytes per pointer + small struct ≈ 2 MiB of buffer pointers,
+	// negligible. The underlying batchGroups themselves hold
+	// references to already-marshalled headers/data which dominate
+	// memory; that's bounded by the cache's pending window, not by
+	// this channel.
+	submitQueueSize = 10240
 
 	// numUploadWorkersPerStream is how many goroutines per namespace
 	// (header / data) drain the submit channel and call client.Submit

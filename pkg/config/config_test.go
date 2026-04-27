@@ -669,24 +669,27 @@ func TestApplyFiberDefaults_OverridesProfile(t *testing.T) {
 	cfg.DA.BatchingStrategy = "time"
 	cfg.DA.BatchMaxDelay = DurationWrapper{Duration: 10 * time.Second}
 	cfg.DA.BlockTime = DurationWrapper{Duration: 6 * time.Second}
+	// Profile forces MaxPendingHeadersAndData = 0 unconditionally so
+	// block production never gates on Fibre upload latency. Even an
+	// explicit user value gets cleared here.
+	cfg.Node.MaxPendingHeadersAndData = 999
 
 	// Pre-set values the profile must LEAVE alone if non-zero.
 	cfg.DA.BatchSizeThreshold = 0.42
 	cfg.DA.BatchMinItems = 7
-	cfg.Node.MaxPendingHeadersAndData = 999
 
 	cfg.ApplyFiberDefaults()
 
 	require.Equal(t, "adaptive", cfg.DA.BatchingStrategy)
 	require.Equal(t, 1500*time.Millisecond, cfg.DA.BatchMaxDelay.Duration)
 	require.Equal(t, 1*time.Second, cfg.DA.BlockTime.Duration)
+	require.Zero(t, cfg.Node.MaxPendingHeadersAndData,
+		"Fiber profile must force MaxPendingHeadersAndData=0 (no backpressure on block production)")
 
 	require.InDelta(t, 0.42, cfg.DA.BatchSizeThreshold, 0.0001,
 		"non-default BatchSizeThreshold should be preserved")
 	require.Equal(t, uint64(7), cfg.DA.BatchMinItems,
 		"non-default BatchMinItems should be preserved")
-	require.Equal(t, uint64(999), cfg.Node.MaxPendingHeadersAndData,
-		"non-default MaxPendingHeadersAndData should be preserved")
 }
 
 func TestApplyFiberDefaults_FillsZeroValues(t *testing.T) {
@@ -700,5 +703,5 @@ func TestApplyFiberDefaults_FillsZeroValues(t *testing.T) {
 
 	require.InDelta(t, 0.8, cfg.DA.BatchSizeThreshold, 0.0001)
 	require.Equal(t, uint64(1), cfg.DA.BatchMinItems)
-	require.Equal(t, uint64(200), cfg.Node.MaxPendingHeadersAndData)
+	require.Zero(t, cfg.Node.MaxPendingHeadersAndData)
 }
