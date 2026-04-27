@@ -158,6 +158,22 @@ func StartNode(
 			return fmt.Errorf("fiber DA is enabled but no fiber client was provided")
 		}
 
+		// fibre-experiment: apply Fiber-tuned overrides to DA + Node
+		// settings (BatchingStrategy=adaptive, BatchMaxDelay=1.5s,
+		// DA.BlockTime=1s, MaxPendingHeadersAndData=200) plus a 120 MiB
+		// per-blob cap. ApplyFiberDefaults documents the profile;
+		// SetMaxBlobSize lives here (not in config) to avoid an import
+		// cycle. Both run before any node goroutines are spawned.
+		nodeConfig.ApplyFiberDefaults()
+		block.SetMaxBlobSize(120 * 1024 * 1024)
+		logger.Info().
+			Str("batching_strategy", nodeConfig.DA.BatchingStrategy).
+			Dur("batch_max_delay", nodeConfig.DA.BatchMaxDelay.Duration).
+			Dur("da_block_time", nodeConfig.DA.BlockTime.Duration).
+			Uint64("max_pending", nodeConfig.Node.MaxPendingHeadersAndData).
+			Uint64("max_blob_bytes", block.MaxBlobSize()).
+			Msg("applied Fiber-tuned config defaults")
+
 		mainKV := store.NewEvNodeKVStore(datastore)
 		baseStore := store.New(mainKV)
 

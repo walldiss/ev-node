@@ -19,6 +19,20 @@ func DefaultBlockOptions() BlockOptions {
 	return common.DefaultBlockOptions()
 }
 
+// SetMaxBlobSize overrides the per-blob byte cap that the executor and
+// DA submitter use when sizing batches and validating individual blobs.
+// Intended to be called once at startup before the node is constructed.
+// Used by the fibre-experiment wiring to lift the 5 MiB Celestia default
+// to Fibre's ~128 MiB headroom.
+func SetMaxBlobSize(n uint64) {
+	common.DefaultMaxBlobSize = n
+}
+
+// MaxBlobSize returns the current per-blob byte cap.
+func MaxBlobSize() uint64 {
+	return common.DefaultMaxBlobSize
+}
+
 // Expose Metrics for constructor
 type Metrics = common.Metrics
 

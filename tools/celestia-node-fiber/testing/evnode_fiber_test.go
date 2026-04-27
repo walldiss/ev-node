@@ -36,7 +36,6 @@ import (
 
 const (
 	evnodeBlockTime    = 200 * time.Millisecond
-	evnodeDABlockTime  = 1 * time.Second
 	evnodeHeaderNS     = "ev-fib-ht"
 	evnodeDataNS       = "ev-fib-da"
 	evnodeChainID      = "ev-fiber-test"
@@ -260,15 +259,19 @@ func newFiberEvNode(t *testing.T, ctx context.Context, fiberClient block.FiberCl
 	cfg.Node.BlockTime = config.DurationWrapper{Duration: evnodeBlockTime}
 	cfg.Node.LazyMode = false
 	// 100 ms scrape keeps the reaper draining the InMem tx channel faster
-	// than producers under load, so blocks don't accumulate >5 MiB of txs
-	// in a single batch and trip the DefaultMaxBlobSize cap.
+	// than producers under load, so blocks don't accumulate beyond the
+	// per-blob byte cap and trip "item exceeds maximum blob size".
 	cfg.Node.ScrapeInterval = config.DurationWrapper{Duration: 100 * time.Millisecond}
-	cfg.DA.BlockTime = config.DurationWrapper{Duration: evnodeDABlockTime}
 	cfg.DA.Namespace = evnodeHeaderNS
 	cfg.DA.DataNamespace = evnodeDataNS
-	cfg.DA.BatchingStrategy = "immediate"
 	cfg.DA.Fiber.Enabled = true
 	cfg.DA.RequestTimeout = config.DurationWrapper{Duration: 60 * time.Second}
+	// Run the same Fiber-tuned profile that pkg/cmd/run_node.go applies
+	// when Fiber is enabled (BatchingStrategy=adaptive, BatchMaxDelay=1.5s,
+	// DA.BlockTime=1s, MaxPendingHeadersAndData=200) plus the 120 MiB
+	// blob-size lift, so this test exercises what production wires.
+	cfg.ApplyFiberDefaults()
+	block.SetMaxBlobSize(120 * 1024 * 1024)
 	cfg.P2P.ListenAddress = "/ip4/0.0.0.0/tcp/0"
 	cfg.P2P.DisableConnectionGater = true
 	cfg.Instrumentation.Prometheus = false

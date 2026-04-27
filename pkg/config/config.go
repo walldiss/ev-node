@@ -343,6 +343,49 @@ func (d *DAConfig) IsFiberEnabled() bool {
 	return d.Fiber.Enabled
 }
 
+// ApplyFiberDefaults overrides DA and Node settings with values tuned
+// for the Fibre adapter's high-throughput / low-latency profile.
+// Called from run_node.go when DA.Fiber.Enabled is true; safe to call
+// in any order — no-op when Fiber is off.
+//
+// This is part of the fibre-experiment branch. It intentionally
+// overrides user-set values for the fields it touches: the Fibre
+// experiment is a curated profile, not a free-form mix-and-match. If
+// any of these need to be different, edit this method.
+//
+// Note: the per-blob byte cap (block.MaxBlobSize) is also bumped for
+// Fibre, but that mutation lives in the wiring layer (run_node.go) to
+// avoid a config → block import cycle.
+func (c *Config) ApplyFiberDefaults() {
+	if !c.DA.IsFiberEnabled() {
+		return
+	}
+
+	// Adaptive batching: ship a batch when it fills 80% of the blob
+	// budget OR 1.5 s elapses, whichever first. Matches Fibre's claimed
+	// per-blob upload latency so the submitter doesn't artificially hold
+	// blocks waiting for a deadline that's longer than the upload itself.
+	c.DA.BatchingStrategy = "adaptive"
+	if c.DA.BatchSizeThreshold <= 0 || c.DA.BatchSizeThreshold > 1 {
+		c.DA.BatchSizeThreshold = 0.8
+	}
+	c.DA.BatchMaxDelay = DurationWrapper{Duration: 1500 * time.Millisecond}
+	if c.DA.BatchMinItems == 0 {
+		c.DA.BatchMinItems = 1
+	}
+
+	// Fibre settlement is <2 s end-to-end; Celestia's 6 s default makes
+	// processDAInclusionLoop's ticker lag the actual DA tip by ~5 s.
+	// Drop to 1 s so inclusion-height tracking and metrics keep pace.
+	c.DA.BlockTime = DurationWrapper{Duration: 1 * time.Second}
+
+	// Bound the pending cache so a transient Fibre stall doesn't grow
+	// memory + store unboundedly. 200 ≈ 40 s of headroom at 5 blocks/s.
+	if c.Node.MaxPendingHeadersAndData == 0 {
+		c.Node.MaxPendingHeadersAndData = 200
+	}
+}
+
 // GetNamespace returns the namespace for header submissions.
 func (d *DAConfig) GetNamespace() string {
 	return d.Namespace

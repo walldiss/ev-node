@@ -154,7 +154,7 @@ func TestAddFlags(t *testing.T) {
 	assertFlagValue(t, flags, FlagPruningInterval, DefaultConfig().Pruning.Interval.Duration)
 
 	// Count the number of flags we're explicitly checking
-	expectedFlagCount := 84 // Update this number if you add more flag checks above
+	expectedFlagCount := 87 // Update this number if you add more flag checks above
 
 	// Get the actual number of flags (both regular and persistent)
 	actualFlagCount := 0
@@ -652,4 +652,53 @@ func TestSignerValidation(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.expectError)
 		})
 	}
+}
+
+func TestApplyFiberDefaults_NoOpWhenDisabled(t *testing.T) {
+	cfg := DefaultConfig()
+	before := cfg
+	cfg.ApplyFiberDefaults()
+	require.Equal(t, before, cfg, "ApplyFiberDefaults must be a no-op when Fiber is off")
+}
+
+func TestApplyFiberDefaults_OverridesProfile(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DA.Fiber.Enabled = true
+
+	// Pre-set values that the profile MUST override (not preserve).
+	cfg.DA.BatchingStrategy = "time"
+	cfg.DA.BatchMaxDelay = DurationWrapper{Duration: 10 * time.Second}
+	cfg.DA.BlockTime = DurationWrapper{Duration: 6 * time.Second}
+
+	// Pre-set values the profile must LEAVE alone if non-zero.
+	cfg.DA.BatchSizeThreshold = 0.42
+	cfg.DA.BatchMinItems = 7
+	cfg.Node.MaxPendingHeadersAndData = 999
+
+	cfg.ApplyFiberDefaults()
+
+	require.Equal(t, "adaptive", cfg.DA.BatchingStrategy)
+	require.Equal(t, 1500*time.Millisecond, cfg.DA.BatchMaxDelay.Duration)
+	require.Equal(t, 1*time.Second, cfg.DA.BlockTime.Duration)
+
+	require.InDelta(t, 0.42, cfg.DA.BatchSizeThreshold, 0.0001,
+		"non-default BatchSizeThreshold should be preserved")
+	require.Equal(t, uint64(7), cfg.DA.BatchMinItems,
+		"non-default BatchMinItems should be preserved")
+	require.Equal(t, uint64(999), cfg.Node.MaxPendingHeadersAndData,
+		"non-default MaxPendingHeadersAndData should be preserved")
+}
+
+func TestApplyFiberDefaults_FillsZeroValues(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DA.Fiber.Enabled = true
+	cfg.DA.BatchSizeThreshold = 0
+	cfg.DA.BatchMinItems = 0
+	cfg.Node.MaxPendingHeadersAndData = 0
+
+	cfg.ApplyFiberDefaults()
+
+	require.InDelta(t, 0.8, cfg.DA.BatchSizeThreshold, 0.0001)
+	require.Equal(t, uint64(1), cfg.DA.BatchMinItems)
+	require.Equal(t, uint64(200), cfg.Node.MaxPendingHeadersAndData)
 }
