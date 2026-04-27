@@ -3,6 +3,7 @@ package da
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,6 +87,9 @@ func TestFiberClient_Submit_UploadError(t *testing.T) {
 
 	require.Equal(t, datypes.StatusError, res.Code)
 	require.Contains(t, res.Message, "fiber upload failed")
+	// Nothing was uploaded — SubmittedCount must reflect that. The old
+	// implementation returned len(data)-1 here, which is a footgun.
+	require.Zero(t, res.SubmittedCount, "failed upload must report SubmittedCount=0")
 }
 
 func TestFiberClient_Submit_CanceledContext(t *testing.T) {
@@ -449,6 +453,122 @@ func TestFiberClient_FullSubmitRetrieveCycle(t *testing.T) {
 	valid, err := cl.Validate(context.Background(), submitRes.IDs, proofs, ns)
 	require.NoError(t, err)
 	require.True(t, valid[0])
+}
+
+// TestFiberClient_Submit_PropagatesContext verifies that the caller's
+// context cancellation reaches fiber.Upload. Before the fix Submit used
+// context.Background() and an outer cancel could leak inflight uploads.
+func TestFiberClient_Submit_PropagatesContext(t *testing.T) {
+	mock := fibremock.NewMockDA(fibremock.DefaultMockDAConfig())
+	rec := &uploadCtxRecorder{FiberClient: mock}
+	cl, err := NewFiberClient(FiberConfig{
+		Client:         rec,
+		Logger:         zerolog.Nop(),
+		DefaultTimeout: 5 * time.Second,
+		Namespace:      "test-ns",
+		DataNamespace:  "test-ns",
+	})
+	require.NoError(t, err)
+
+	type ctxKey struct{}
+	parentCtx := context.WithValue(context.Background(), ctxKey{}, "marker")
+
+	ns := datypes.NamespaceFromString("test-ns").Bytes()
+	res := cl.Submit(parentCtx, [][]byte{[]byte("data")}, 0, ns, nil)
+
+	require.Equal(t, datypes.StatusSuccess, res.Code)
+	require.NotNil(t, rec.lastCtx, "Upload should have received a context")
+	require.Equal(t, "marker", rec.lastCtx.Value(ctxKey{}),
+		"caller's ctx must propagate to fiber.Upload — not context.Background()")
+}
+
+// TestFiberClient_GetLatestDAHeight_Default verifies the panic was
+// replaced and a sane height is returned even with no Subscribe traffic.
+func TestFiberClient_GetLatestDAHeight_Default(t *testing.T) {
+	mock := fibremock.NewMockDA(fibremock.DefaultMockDAConfig())
+	cl, err := NewFiberClient(FiberConfig{
+		Client:            mock,
+		Logger:            zerolog.Nop(),
+		Namespace:         "ns",
+		DataNamespace:     "ns",
+		LastKnownDAHeight: 42,
+	})
+	require.NoError(t, err)
+
+	h, err := cl.GetLatestDAHeight(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), h, "should fall back to LastKnownDAHeight")
+}
+
+// TestFiberClient_HeightTrackedViaSubscribe verifies that Subscribe's
+// blob events bump latestObservedHeight, which Submit and
+// GetLatestDAHeight then expose.
+func TestFiberClient_HeightTrackedViaSubscribe(t *testing.T) {
+	_, cl := makeTestFiberClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ns := datypes.NamespaceFromString("test-ns").Bytes()
+	ch, err := cl.Subscribe(ctx, ns, false)
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+
+	// Subscribe spawns a goroutine that registers with the mock under
+	// lock. There's no way to await registration synchronously, so push
+	// uploads in a loop until at least one matches a registered
+	// subscriber. The mock notifies non-blockingly so the loop also
+	// guards against a transiently full channel.
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				i++
+				res := cl.Submit(context.Background(),
+					[][]byte{[]byte(fmt.Sprintf("blob-%d", i))}, 0, ns, nil)
+				if res.Code != datypes.StatusSuccess {
+					return
+				}
+			}
+		}
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-ch:
+			// observeHeight runs before the Subscribe goroutine writes
+			// to ch, so by the time we receive an event the tip is set.
+			h, err := cl.GetLatestDAHeight(context.Background())
+			require.NoError(t, err)
+			if h >= 1 {
+				cancel() // stop the pump
+				<-pumpDone
+				return
+			}
+		case <-deadline:
+			cancel()
+			<-pumpDone
+			t.Fatal("Subscribe never delivered an event to feed observeHeight")
+		}
+	}
+}
+
+type uploadCtxRecorder struct {
+	FiberClient
+	lastCtx context.Context
+}
+
+func (r *uploadCtxRecorder) Upload(ctx context.Context, namespace, data []byte) (fiber.UploadResult, error) {
+	r.lastCtx = ctx
+	return r.FiberClient.Upload(ctx, namespace, data)
 }
 
 type faultInjector struct {

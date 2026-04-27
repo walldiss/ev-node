@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -37,6 +38,15 @@ type fiberDAClient struct {
 	namespaceBz       []byte
 	dataNamespaceBz   []byte
 	lastKnownDAHeight uint64
+
+	// latestObservedHeight tracks the highest DA height seen via Subscribe's
+	// blob events. Submit and GetLatestDAHeight read it; Subscribe writes
+	// it. With Fibre's async-settle design the Upload call returns before
+	// the blob lands on chain, so we cannot report the exact settlement
+	// height of a freshly uploaded blob — only the latest height observed
+	// so far. Seeded from lastKnownDAHeight at construction so first reads
+	// before any subscription event still get a sane (non-zero) value.
+	latestObservedHeight atomic.Uint64
 }
 
 var _ FullClient = (*fiberDAClient)(nil)
@@ -50,14 +60,38 @@ func NewFiberClient(cfg FiberConfig) (FullClient, error) {
 		cfg.DefaultTimeout = 60 * time.Second
 	}
 
-	return &fiberDAClient{
+	c := &fiberDAClient{
 		fiber:             cfg.Client,
 		logger:            cfg.Logger.With().Str("component", "fiber_da_client").Logger(),
 		defaultTimeout:    cfg.DefaultTimeout,
 		lastKnownDAHeight: cfg.LastKnownDAHeight,
 		namespaceBz:       datypes.NamespaceFromString(cfg.Namespace).Bytes(),
 		dataNamespaceBz:   datypes.NamespaceFromString(cfg.DataNamespace).Bytes(),
-	}, nil
+	}
+	c.latestObservedHeight.Store(cfg.LastKnownDAHeight)
+	return c, nil
+}
+
+// observeHeight bumps latestObservedHeight if h is larger. CAS loop so
+// multiple Subscribe goroutines (e.g. header + data) can both feed it.
+func (c *fiberDAClient) observeHeight(h uint64) {
+	for {
+		cur := c.latestObservedHeight.Load()
+		if h <= cur {
+			return
+		}
+		if c.latestObservedHeight.CompareAndSwap(cur, h) {
+			return
+		}
+	}
+}
+
+// currentHeight returns the best estimate of the DA tip height. Used by
+// Submit (as ResultSubmit.Height) and GetLatestDAHeight. May be zero
+// only if the client was constructed with LastKnownDAHeight=0 AND no
+// Subscribe event has fired yet.
+func (c *fiberDAClient) currentHeight() uint64 {
+	return c.latestObservedHeight.Load()
 }
 
 func (c *fiberDAClient) Submit(ctx context.Context, data [][]byte, _ float64, namespace []byte, _ []byte) datypes.ResultSubmit {
@@ -89,7 +123,7 @@ func (c *fiberDAClient) Submit(ctx context.Context, data [][]byte, _ float64, na
 
 	flat := flattenBlobs(data)
 
-	result, err := c.fiber.Upload(context.Background(), namespace[len(namespace)-10:], flat)
+	result, err := c.fiber.Upload(ctx, namespace[len(namespace)-10:], flat)
 	if err != nil {
 		code := datypes.StatusError
 		switch {
@@ -101,25 +135,33 @@ func (c *fiberDAClient) Submit(ctx context.Context, data [][]byte, _ float64, na
 
 		c.logger.Error().Err(err).Msg("fiber upload failed")
 
+		// Nothing was uploaded — the previous len(data)-1 was wrong and
+		// could mask data loss if a future caller relied on partial
+		// success accounting.
 		return datypes.ResultSubmit{
 			BaseResult: datypes.BaseResult{
 				Code:           code,
 				Message:        fmt.Sprintf("fiber upload failed for blob: %v", err),
-				SubmittedCount: uint64(len(data) - 1),
+				SubmittedCount: 0,
 				BlobSize:       blobSize,
 				Timestamp:      time.Now(),
 			},
 		}
 	}
 
-	c.logger.Debug().Int("num_ids", len(data)).Uint64("height", 0 /* TODO */).Msg("fiber DA submission successful")
+	// Best-effort DA-tip height. The blob lands a few blocks later via
+	// async PFF settlement; the cache only relies on this height being
+	// monotonic and ≤ the actual settlement height, both of which hold
+	// because Subscribe feeds latestObservedHeight in order from Listen.
+	height := c.currentHeight()
+	c.logger.Debug().Int("num_ids", len(data)).Uint64("height", height).Msg("fiber DA submission successful")
 
 	return datypes.ResultSubmit{
 		BaseResult: datypes.BaseResult{
 			Code:           datypes.StatusSuccess,
 			IDs:            [][]byte{result.BlobID},
 			SubmittedCount: uint64(len(data)),
-			Height:         0, /* TODO */
+			Height:         height,
 			BlobSize:       blobSize,
 			Timestamp:      time.Now(),
 		},
@@ -160,6 +202,7 @@ loop:
 			if !ok {
 				break loop
 			}
+			c.observeHeight(event.Height)
 			if event.Height > height {
 				break loop
 			}
@@ -272,6 +315,12 @@ func (c *fiberDAClient) Subscribe(ctx context.Context, namespace []byte, _ bool)
 					return
 				}
 
+				// Feed the height tracker before any per-event work, so
+				// even events with download/decode failures still bump
+				// the observed tip — Submit/GetLatestDAHeight use this
+				// purely as an "≥ this much has settled" hint.
+				c.observeHeight(event.Height)
+
 				blobData, err := c.fiber.Download(ctx, event.BlobID)
 				if err != nil {
 					c.logger.Error().Err(err).Bytes("blob_id", event.BlobID).Msg("failed to retrieve blob")
@@ -301,7 +350,12 @@ func (c *fiberDAClient) Subscribe(ctx context.Context, namespace []byte, _ bool)
 }
 
 func (c *fiberDAClient) GetLatestDAHeight(context.Context) (uint64, error) {
-	panic(fmt.Errorf("p2p should not be enabled"))
+	// Best-effort tip from observed Listen events. With Fibre disabling
+	// p2p in the typical deployment this should rarely be called by the
+	// hot path, but the syncer's hint-validation code does call it under
+	// some peer-gossip scenarios — returning a usable height beats the
+	// previous panic.
+	return c.currentHeight(), nil
 }
 
 func (c *fiberDAClient) GetProofs(_ context.Context, ids []datypes.ID, _ []byte) ([]datypes.Proof, error) {
