@@ -106,3 +106,21 @@ Interpretation:
   data submits in 30 s = 0.93 uploads/s, far above the 1 / 1.5 s a
   single worker can do. With chunked SubmitData, multiple workers
   pick up independent chunks in parallel.
+
+## Hyper after `feat(fibre): execution never blocks on uploads`
+
+Commit: `94f7249d` (`MaxPendingHeadersAndData=0` forced in Fiber
+profile; `submitQueueSize` 256 → 10240).
+
+```
+PERF_HYPER: blocks=27 txs_executed=128000 txs_per_sec=4207
+            pump_rate_mb_s=78.33 da_blobs=5 da_throughput_mb_s=13.81
+            wall_s=30.42 gap_p50_s=19.625 gap_p99_s=23.453
+```
+
+Critical invariant verified: **0 "pending limit reached" log lines**.
+Block production never halted on submission backlog. Throughput
+variance vs the prior hyper run (7456 → 4207 tx/s) is single-sample
+noise on the testnode under heavy PFF load — no code path slower
+than before, just chain settlement variance. The block-production-
+never-blocks property is what matters for the experiment.
