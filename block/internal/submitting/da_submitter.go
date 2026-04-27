@@ -35,6 +35,22 @@ const (
 	signingWorkerPoolSize = 0 // 0 means use runtime.GOMAXPROCS(0)
 
 	submitQueueSize = 256
+
+	// numUploadWorkersPerStream is how many goroutines per namespace
+	// (header / data) drain the submit channel and call client.Submit
+	// concurrently. With Fibre's ~1.5 s per-upload latency and a 120 MiB
+	// blob cap, sustained throughput is bounded by
+	// (workers × blob_bytes / latency). 4 workers × 120 MiB / 1.5 s ≈
+	// 320 MiB/s — well above the perf bench's input rate while leaving
+	// headroom for the data stream's larger payloads.
+	//
+	// Concurrency at this level requires that downstream cache state
+	// (lastSubmittedHeight, SetLastSubmittedHeaderHeight, envelope cache
+	// invalidation) survive out-of-order completion. setLastSubmittedHeight
+	// already CAS-advances; lastSubmittedHeight is now CAS-advanced too;
+	// onSuccess callbacks operate on disjoint groups so cache writes
+	// don't conflict.
+	numUploadWorkersPerStream = 4
 )
 
 const initialBackoff = 100 * time.Millisecond
@@ -206,35 +222,100 @@ func NewDASubmitter(
 		signingWorkers:       workers,
 		headerDAHintAppender: headerDAHintAppender,
 		dataDAHintAppender:   dataDAHintAppender,
-		headerSubmitCh:       make(chan *batchGroup, submitQueueSize),
-		dataSubmitCh:         make(chan *batchGroup, submitQueueSize),
-		headerFlushCh:        make(chan chan struct{}),
-		dataFlushCh:          make(chan chan struct{}),
+		headerSubmitCh: make(chan *batchGroup, submitQueueSize),
+		dataSubmitCh:   make(chan *batchGroup, submitQueueSize),
+		// Buffered for N workers per stream so Close can post one flush
+		// signal per worker without blocking on goroutine scheduling.
+		headerFlushCh: make(chan chan struct{}, numUploadWorkersPerStream),
+		dataFlushCh:   make(chan chan struct{}, numUploadWorkersPerStream),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.workerCancel = cancel
-	s.workerWg.Add(2)
-	go s.runNamespaceWorker(ctx, s.headerSubmitCh, s.headerFlushCh, "header", s.client.GetHeaderNamespace())
-	go s.runNamespaceWorker(ctx, s.dataSubmitCh, s.dataFlushCh, "data", s.client.GetDataNamespace())
+
+	// Spin numUploadWorkersPerStream goroutines per namespace so multiple
+	// uploads can be in flight concurrently. Each worker reads its own
+	// batchGroup from the shared channel and runs a full processBatch
+	// (with retries + per-blob halving). The flush channels are sized
+	// equal to the worker count so Close can deliver one done signal per
+	// worker without serializing.
+	totalWorkers := numUploadWorkersPerStream * 2
+	s.workerWg.Add(totalWorkers)
+	for i := 0; i < numUploadWorkersPerStream; i++ {
+		go s.runNamespaceWorker(ctx, s.headerSubmitCh, s.headerFlushCh, "header", s.client.GetHeaderNamespace())
+		go s.runNamespaceWorker(ctx, s.dataSubmitCh, s.dataFlushCh, "data", s.client.GetDataNamespace())
+	}
 
 	return s
 }
 
+// Close gracefully shuts the DA submitter down. Two-phase:
+//
+//  1. Send numUploadWorkersPerStream flush signals on each stream's
+//     flush channel — one per worker. Workers see flushCh, drain any
+//     queued batchGroups (calling processBatch on each so onSuccess
+//     fires for already-uploaded items), close their done signal, and
+//     return.
+//  2. After the per-worker done signals are received (or the bounded
+//     timeout fires), cancel the worker context so any goroutine still
+//     mid-retry exits via waitForBackoffOrContext and the WaitGroup
+//     completes. The timeout protects against hung uploads.
+//
+// Callers (Submitter.Stop) are responsible for draining their own
+// senders before calling Close, so no new batchGroups arrive after
+// Close starts. Otherwise a late SubmitHeaders/SubmitData call could
+// race the Close-side flushCh receive and panic on send-after-cancel.
 func (s *DASubmitter) Close() {
 	if s.workerCancel == nil {
 		return
 	}
-	headerDone := make(chan struct{})
-	s.headerFlushCh <- headerDone
-	dataDone := make(chan struct{})
-	s.dataFlushCh <- dataDone
-	<-headerDone
-	<-dataDone
+
+	totalWorkers := numUploadWorkersPerStream * 2
+	doneSignals := make(chan struct{}, totalWorkers)
+	for i := 0; i < numUploadWorkersPerStream; i++ {
+		select {
+		case s.headerFlushCh <- doneSignals:
+		default:
+			s.logger.Warn().Msg("header flush channel full; some workers won't drain cleanly")
+		}
+		select {
+		case s.dataFlushCh <- doneSignals:
+		default:
+			s.logger.Warn().Msg("data flush channel full; some workers won't drain cleanly")
+		}
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for received := 0; received < totalWorkers; {
+		select {
+		case <-doneSignals:
+			received++
+		case <-deadline.C:
+			s.logger.Warn().Int("completed", received).Int("total", totalWorkers).
+				Msg("DA submitter Close timed out; cancelling stuck workers")
+			s.workerCancel()
+			s.workerWg.Wait()
+			return
+		}
+	}
 	s.workerCancel()
 	s.workerWg.Wait()
 }
 
+// runNamespaceWorker drains batchGroups from ch and submits them to DA.
+// With numUploadWorkersPerStream copies running per namespace, multiple
+// uploads can be in flight concurrently. Each worker still opportunistically
+// merges any batches that have arrived behind the head while it pulls,
+// so a burst of small batches collapses into a single upload — but if
+// multiple bursts are queued, separate workers pick them up in parallel
+// instead of waiting in line.
+//
+// On flushCh receipt, the worker drains and processes any remaining
+// queued batches (so already-signed envelopes still get onSuccess
+// fired and the pending cache doesn't leak), signals done, and exits.
+// On ctx.Done, same drain but onSuccess(0, 0) is the expected outcome
+// because processBatch sees a cancelled ctx.
 func (s *DASubmitter) runNamespaceWorker(ctx context.Context, ch chan *batchGroup, flushCh chan chan struct{}, itemType string, namespace []byte) {
 	defer s.workerWg.Done()
 	for {
@@ -248,7 +329,8 @@ func (s *DASubmitter) runNamespaceWorker(ctx context.Context, ch chan *batchGrou
 			drainChannel(ch, func(g *batchGroup) {
 				s.processBatch(ctx, []*batchGroup{g}, itemType, namespace)
 			})
-			close(done)
+			done <- struct{}{}
+			return
 		case first := <-ch:
 			groups := []*batchGroup{first}
 		drainLoop:
@@ -582,7 +664,19 @@ func (s *DASubmitter) makeHeaderPostSubmit(ctx context.Context, cache cache.Mana
 		if l := len(submitted); l > 0 {
 			lastHeight := submitted[l-1].Height()
 			cache.SetLastSubmittedHeaderHeight(ctx, lastHeight)
-			s.lastSubmittedHeight.Store(lastHeight)
+			// CAS so out-of-order completions from parallel workers can't
+			// regress lastSubmittedHeight backwards. The envelope cache's
+			// lazy-invalidation logic depends on this value being
+			// monotonic.
+			for {
+				cur := s.lastSubmittedHeight.Load()
+				if lastHeight <= cur {
+					break
+				}
+				if s.lastSubmittedHeight.CompareAndSwap(cur, lastHeight) {
+					break
+				}
+			}
 		}
 	}
 }

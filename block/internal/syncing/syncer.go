@@ -419,9 +419,23 @@ func (s *Syncer) processLoop(ctx context.Context) {
 
 func (s *Syncer) startSyncWorkers(ctx context.Context) {
 	// DA follower is already started in Start().
-	s.wg.Add(2)
+	s.wg.Add(1)
 	go s.pendingWorkerLoop(ctx)
-	go s.p2pWorkerLoop(ctx)
+
+	// fibre-experiment: when Fiber is the DA backend, disable the
+	// syncer's P2P worker. The aggregator already skips P2P broadcast
+	// (executor.go) and Fiber's Subscribe delivers everything via the
+	// DA path, so the P2P worker only burns CPU waiting on a header it
+	// will never see. The libp2p host itself still runs (idle, no peers
+	// in single-node tests; useless gossip in multi-peer setups) — a
+	// full host gate would touch node/full.go and the sync services
+	// and was deemed out of scope for the experiment.
+	if !s.config.DA.IsFiberEnabled() {
+		s.wg.Add(1)
+		go s.p2pWorkerLoop(ctx)
+	} else {
+		s.logger.Info().Msg("Fiber DA enabled; skipping syncer P2P worker")
+	}
 }
 
 // HasReachedDAHead returns true once the DA follower has caught up to the DA head.
