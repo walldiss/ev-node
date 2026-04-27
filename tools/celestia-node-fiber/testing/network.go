@@ -31,9 +31,15 @@ const (
 	// bridge and consensus node agree on network identity.
 	defaultChainID = "private"
 
-	// escrowDeposit is a generous initial escrow. Uploads consume from
-	// escrow for gas + blob fees, so leave headroom for multiple runs.
-	escrowDeposit = 50_000_000 // 50 TIA in utia
+	// escrowDeposit is the initial escrow funded by StartNetwork. Each
+	// MsgPayForFibre debits ~0.7 TIA, so the budget caps how many uploads
+	// a single test run can do. The genesis account itself holds ~1B TIA
+	// so this only constrains escrow, not what we *could* fund.
+	//
+	// 50_000 TIA gives ~70k uploads of headroom — comfortably above the
+	// perf benchmark's worst-case (~600 uploads at 30 s × 1000 tx/s).
+	// Showcase tests only do ~10 uploads so the larger deposit is free.
+	escrowDeposit = 50_000_000_000 // 50_000 TIA in utia
 
 	// clientAccount is the keyring account the adapter uses to sign
 	// payment promises and MsgPayForFibre. Pre-funded in genesis; also
