@@ -86,8 +86,10 @@ The execution client must implement the Evolve execution gRPC interface.`,
 			return err
 		}
 
-		// Start the node
-		return rollcmd.StartNode(logger, cmd, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{})
+		// Start the node. fibre-experiment: StartNode now takes a
+		// FiberClient as the trailing arg. The grpc app doesn't wire
+		// Fiber — nil is fine as long as DA.Fiber.Enabled stays false.
+		return rollcmd.StartNode(logger, cmd, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{}, nil)
 	},
 }
 

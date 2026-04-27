@@ -97,7 +97,12 @@ var RunCmd = &cobra.Command{
 			return err
 		}
 
-		return cmd.StartNode(logger, command, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{})
+		// fibre-experiment: StartNode now takes a FiberClient as the
+		// trailing arg. testapp doesn't wire Fiber here (the Fiber-
+		// aware runner lives in tools/talis/cmd/evnode-fibre); nil is
+		// fine as long as DA.Fiber.Enabled stays false in testapp's
+		// config.
+		return cmd.StartNode(logger, command, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{}, nil)
 	},
 }
 

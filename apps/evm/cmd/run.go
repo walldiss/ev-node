@@ -131,7 +131,10 @@ var RunCmd = &cobra.Command{
 			}()
 		}
 
-		return rollcmd.StartNode(logger, cmd, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{})
+		// fibre-experiment: StartNode now takes a FiberClient as the
+		// trailing arg. The EVM app doesn't wire Fiber — nil is fine
+		// as long as DA.Fiber.Enabled stays false in its config.
+		return rollcmd.StartNode(logger, cmd, executor, sequencer, nodeKey, datastore, nodeConfig, genesis, node.NodeOptions{}, nil)
 	},
 }
 
