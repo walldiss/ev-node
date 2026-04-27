@@ -34,7 +34,9 @@ const (
 	// ev-node aggregators are CPU + network bound (block production
 	// + DA submit pipeline). Same shape as bridges; can be sized up
 	// per-experiment via `--slug`.
-	AWSDefaultEvnodeInstanceType        = "c6in.2xlarge"
+	AWSDefaultEvnodeInstanceType = "c6in.2xlarge"
+	// Load generators are network-bound; same shape as evnode/bridge.
+	AWSDefaultLoadgenInstanceType       = "c6in.2xlarge"
 	AWSDefaultObservabilityInstanceType = "t3.medium"
 	AWSDefaultRootVolumeGB              = int32(400)
 
@@ -100,7 +102,7 @@ func (c *AWSClient) Up(ctx context.Context, workers int) error {
 	}
 
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
+	allInstances := append(append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...), c.cfg.Loadgens...)
 	for _, v := range allInstances {
 		if v.Provider != AWS {
 			continue
@@ -135,7 +137,7 @@ func (c *AWSClient) Up(ctx context.Context, workers int) error {
 
 func (c *AWSClient) Down(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
+	allInstances := append(append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...), c.cfg.Loadgens...)
 	for _, v := range allInstances {
 		if v.Provider != AWS {
 			continue
@@ -233,6 +235,17 @@ func NewAWSEvnode(region string) Instance {
 	i := NewBaseInstance(Evnode)
 	i.Provider = AWS
 	i.Slug = AWSDefaultEvnodeInstanceType
+	i.Region = region
+	return i
+}
+
+func NewAWSLoadgen(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomAWSRegion()
+	}
+	i := NewBaseInstance(Loadgen)
+	i.Provider = AWS
+	i.Slug = AWSDefaultLoadgenInstanceType
 	i.Region = region
 	return i
 }

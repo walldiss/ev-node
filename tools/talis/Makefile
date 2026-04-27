@@ -32,6 +32,7 @@ CELESTIA_NODE_REPO ?= ../../../celestia-node
 CELESTIA_NODE_REF  ?= feature/fibre-experimental
 
 EVNODE_RUNNER_PATH ?= ../celestia-node-fiber/cmd/evnode-fibre
+TXSIM_PATH         ?= ./cmd/evnode-txsim
 
 BUILD_DIR := $(CURDIR)/build
 
@@ -43,9 +44,9 @@ GOARCH ?= amd64
 # matters for upload over slow links.
 GOFLAGS_COMMON := -trimpath -ldflags='-s -w'
 
-.PHONY: build-bins build-app build-node build-evnode clean check-repos
+.PHONY: build-bins build-app build-node build-evnode build-txsim clean check-repos
 
-build-bins: build-app build-node build-evnode
+build-bins: build-app build-node build-evnode build-txsim
 	@echo
 	@echo "✅ All binaries built into $(BUILD_DIR):"
 	@ls -lh $(BUILD_DIR)
@@ -88,6 +89,14 @@ build-evnode: $(BUILD_DIR)
 		GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
 		go build $(GOFLAGS_COMMON) -o $(BUILD_DIR)/evnode .
 	@echo "    -> $(BUILD_DIR)/evnode"
+
+# evnode-txsim is the load generator that ships to loadgen-* nodes.
+# Stdlib-only, so the build is fast and has no sibling-repo deps.
+build-txsim: $(BUILD_DIR)
+	@echo "==> Building evnode-txsim (this repo, current HEAD)"
+	@GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
+		go build $(GOFLAGS_COMMON) -o $(BUILD_DIR)/evnode-txsim $(TXSIM_PATH)
+	@echo "    -> $(BUILD_DIR)/evnode-txsim"
 
 # Sanity check: make sure the sibling clones exist so we fail with a
 # friendly message instead of a deep go-tool error.

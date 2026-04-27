@@ -91,6 +91,21 @@ func addCmd() *cobra.Command {
 					}
 				}
 				applySlug(cfg.Evnodes, start, slug)
+			case "loadgen":
+				start := len(cfg.Loadgens)
+				for range count {
+					switch provider {
+					case "digitalocean":
+						cfg = cfg.WithDigitalOceanLoadgen(region)
+					case "googlecloud":
+						cfg = cfg.WithGoogleCloudLoadgen(region)
+					case "aws":
+						cfg = cfg.WithAWSLoadgen(region)
+					default:
+						return fmt.Errorf("unknown provider %q (supported: digitalocean, googlecloud, aws)", provider)
+					}
+				}
+				applySlug(cfg.Loadgens, start, slug)
 			case "light":
 				log.Println("light nodes are not yet supported")
 				return nil
@@ -105,7 +120,7 @@ func addCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&rootDir, "directory", "d", ".", "root directory in which to initialize")
 	cmd.Flags().IntVarP(&count, "count", "c", 0, "Number of nodes to deploy")
 	_ = cmd.MarkFlagRequired("count")
-	cmd.Flags().StringVarP(&nodeType, "type", "t", "", "Type of the node (validator, encoder, bridge, evnode, light)")
+	cmd.Flags().StringVarP(&nodeType, "type", "t", "", "Type of the node (validator, encoder, bridge, evnode, loadgen, light)")
 	_ = cmd.MarkFlagRequired("type")
 	cmd.Flags().StringVarP(&provider, "provider", "p", "digitalocean", "Provider for the node (digitalocean, googlecloud, aws)")
 	cmd.Flags().StringVarP(&region, "region", "r", "random", "the region to deploy the instance in (random if blank)")

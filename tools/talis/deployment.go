@@ -139,7 +139,10 @@ func deployCmd() *cobra.Command {
 				if err := deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
 					return err
 				}
-				return deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+				if err := deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+					return err
+				}
+				return deployLoadgensIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 			}
 			if err := deployPayloadViaS3(cmd.Context(), rootDir, cfg.Validators, tarPath, SSHKeyPath, "/root", "payload/validator_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
 				if !ignoreFailed {
@@ -156,7 +159,10 @@ func deployCmd() *cobra.Command {
 			if err := deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
 				return err
 			}
-			return deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+			if err := deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+				return err
+			}
+			return deployLoadgensIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 		},
 	}
 
@@ -240,6 +246,44 @@ func deployBridgesIfConfigured(ctx context.Context, cfg Config, rootDir, sshKeyP
 	}
 
 	log.Printf("Bridge deployment complete\n")
+	return nil
+}
+
+// deployLoadgensIfConfigured tars the loadgen-payload directory
+// (evnode-txsim binary + templated init script) and ships it to each
+// load-gen instance. The init script poll-waits for ev-node's /stats
+// endpoint to become reachable, then bursts traffic at /tx for the
+// configured duration, writing a final TXSIM: line to /root/txsim.log.
+func deployLoadgensIfConfigured(ctx context.Context, cfg Config, rootDir, sshKeyPath string, directUpload bool, workers int) error {
+	if len(cfg.Loadgens) == 0 {
+		return nil
+	}
+
+	lgPayloadDir := filepath.Join(rootDir, "loadgen-payload")
+	if _, err := os.Stat(lgPayloadDir); os.IsNotExist(err) {
+		return fmt.Errorf("loadgen-payload directory not found — run 'talis genesis' first")
+	}
+
+	lgTarPath := filepath.Join(rootDir, "loadgen-payload.tar.gz")
+	log.Printf("Compressing loadgen payload to %s\n", lgTarPath)
+	tarCmd := exec.Command("tar", "-czf", lgTarPath, "-C", rootDir, "loadgen-payload")
+	tarCmd.Env = append(os.Environ(), "COPYFILE_DISABLE=1")
+	if output, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to compress loadgen payload: %w, output: %s", err, string(output))
+	}
+	log.Printf("Sending loadgen payload to %d loadgen(s)...\n", len(cfg.Loadgens))
+
+	if directUpload {
+		if err := deployPayloadDirect(cfg.Loadgens, lgTarPath, sshKeyPath, "/root", "loadgen-payload/loadgen_init.sh", 7*time.Minute, workers); err != nil {
+			return fmt.Errorf("loadgen deployment: %w", err)
+		}
+	} else {
+		if err := deployPayloadViaS3(ctx, rootDir, cfg.Loadgens, lgTarPath, sshKeyPath, "/root", "loadgen-payload/loadgen_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
+			return fmt.Errorf("loadgen deployment: %w", err)
+		}
+	}
+
+	log.Printf("loadgen deployment complete (init script will poll-wait for ev-node /stats then start txsim)\n")
 	return nil
 }
 

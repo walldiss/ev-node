@@ -21,6 +21,7 @@ const (
 	GCDefaultEncoderMachineType       = "c3d-highcpu-8"
 	GCDefaultBridgeMachineType        = "c3d-highcpu-8"
 	GCDefaultEvnodeMachineType        = "c3d-highcpu-8"
+	GCDefaultLoadgenMachineType       = "c3d-highcpu-8"
 	GCDefaultObservabilityMachineType = "e2-medium"
 	GCDefaultImage                    = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
 	GCDefaultDiskSizeGB               = 400
@@ -76,7 +77,7 @@ func NewGCClient(cfg Config) (*GCClient, error) {
 
 func (c *GCClient) Up(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
+	allInstances := append(append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...), c.cfg.Loadgens...)
 	for _, v := range allInstances {
 		if v.Provider != GoogleCloud {
 			continue
@@ -116,7 +117,7 @@ func (c *GCClient) Up(ctx context.Context, workers int) error {
 
 func (c *GCClient) Down(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
+	allInstances := append(append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...), c.cfg.Loadgens...)
 	for _, v := range allInstances {
 		if v.Provider != GoogleCloud {
 			continue
@@ -256,6 +257,17 @@ func NewGoogleCloudEvnode(region string) Instance {
 	i := NewBaseInstance(Evnode)
 	i.Provider = GoogleCloud
 	i.Slug = GCDefaultEvnodeMachineType
+	i.Region = region
+	return i
+}
+
+func NewGoogleCloudLoadgen(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomGCRegion()
+	}
+	i := NewBaseInstance(Loadgen)
+	i.Provider = GoogleCloud
+	i.Slug = GCDefaultLoadgenMachineType
 	i.Region = region
 	return i
 }

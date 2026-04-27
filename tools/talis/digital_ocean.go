@@ -19,6 +19,7 @@ const (
 	DODefaultEncoderSlug       = "c2-8vcpu-16gb"
 	DODefaultBridgeSlug        = "c2-8vcpu-16gb"
 	DODefaultEvnodeSlug        = "c2-8vcpu-16gb"
+	DODefaultLoadgenSlug       = "c2-8vcpu-16gb"
 	DODefaultObservabilitySlug = "s-2vcpu-4gb"
 	DODefaultImage             = "ubuntu-24-04-x64"
 	RandomRegion               = "random"
@@ -82,6 +83,17 @@ func NewDigitalOceanEvnode(region string) Instance {
 	i := NewBaseInstance(Evnode)
 	i.Provider = DigitalOcean
 	i.Slug = DODefaultEvnodeSlug
+	i.Region = region
+	return i
+}
+
+func NewDigitalOceanLoadgen(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomDORegion()
+	}
+	i := NewBaseInstance(Loadgen)
+	i.Provider = DigitalOcean
+	i.Slug = DODefaultLoadgenSlug
 	i.Region = region
 	return i
 }

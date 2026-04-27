@@ -29,6 +29,12 @@ const (
 	// tools/celestia-node-fiber/cmd/evnode-fibre. One per experiment in
 	// the smallest topology.
 	Evnode NodeType = "evnode"
+
+	// Loadgen is a dedicated load-generator instance running
+	// tools/talis/cmd/evnode-txsim. Lives on its own EC2 instance to
+	// keep its CPU + network footprint from biasing measurements on
+	// the ev-node box.
+	Loadgen NodeType = "loadgen"
 )
 
 var (
@@ -38,6 +44,7 @@ var (
 	observabilityCount = atomic.Uint32{}
 	encoderCount       = atomic.Uint32{}
 	evnodeCount        = atomic.Uint32{}
+	loadgenCount       = atomic.Uint32{}
 )
 
 // NodeName returns the name of the node based on its type and index. The
@@ -58,6 +65,8 @@ func NodeName(nodeType NodeType) string {
 		index = int(encoderCount.Add(1)) - 1
 	case Evnode:
 		index = int(evnodeCount.Add(1)) - 1
+	case Loadgen:
+		index = int(loadgenCount.Add(1)) - 1
 	default:
 		panic(fmt.Sprintf("unknown node type: %s", nodeType))
 	}
@@ -140,7 +149,7 @@ func ExperimentTag(nodeType NodeType, index int, experimentID, chainID string) s
 
 func GetExperimentTag(tags []string) string {
 	for _, tag := range tags {
-		if strings.HasPrefix(tag, "validator-") || strings.HasPrefix(tag, "bridge-") || strings.HasPrefix(tag, "light-") || strings.HasPrefix(tag, "observability-") || strings.HasPrefix(tag, "encoder-") || strings.HasPrefix(tag, "evnode-") {
+		if strings.HasPrefix(tag, "validator-") || strings.HasPrefix(tag, "bridge-") || strings.HasPrefix(tag, "light-") || strings.HasPrefix(tag, "observability-") || strings.HasPrefix(tag, "encoder-") || strings.HasPrefix(tag, "evnode-") || strings.HasPrefix(tag, "loadgen-") {
 			return tag
 		}
 	}
@@ -155,6 +164,7 @@ type Config struct {
 	Observability []Instance `json:"observability,omitempty"`
 	Encoders      []Instance `json:"encoders,omitempty"`
 	Evnodes       []Instance `json:"evnodes,omitempty"`
+	Loadgens      []Instance `json:"loadgens,omitempty"`
 
 	// ChainID is the chain ID of the network. This is used to identify the
 	// network and is also used as the chain ID of the network. It is
@@ -197,6 +207,7 @@ func NewConfig(experiment, chainID string) Config {
 		Observability: []Instance{},
 		Encoders:      []Instance{},
 		Evnodes:       []Instance{},
+		Loadgens:      []Instance{},
 		Experiment:    experiment,
 		ChainID:       TalisChainID(chainID),
 		S3Config: S3Config{
@@ -339,6 +350,24 @@ func (cfg Config) WithAWSEvnode(region string) Config {
 	return cfg
 }
 
+func (cfg Config) WithDigitalOceanLoadgen(region string) Config {
+	i := NewDigitalOceanLoadgen(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Loadgens = append(cfg.Loadgens, i)
+	return cfg
+}
+
+func (cfg Config) WithGoogleCloudLoadgen(region string) Config {
+	i := NewGoogleCloudLoadgen(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Loadgens = append(cfg.Loadgens, i)
+	return cfg
+}
+
+func (cfg Config) WithAWSLoadgen(region string) Config {
+	i := NewAWSLoadgen(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Loadgens = append(cfg.Loadgens, i)
+	return cfg
+}
+
 func (cfg Config) WithChainID(chainID string) Config {
 	cfg.ChainID = TalisChainID(chainID)
 	return cfg
@@ -426,6 +455,13 @@ func (cfg Config) UpdateInstance(name, publicIP, privateIP string) (Config, erro
 		if cfg.Evnodes[i].Name == name {
 			cfg.Evnodes[i].PublicIP = publicIP
 			cfg.Evnodes[i].PrivateIP = privateIP
+			return cfg, nil
+		}
+	}
+	for i := range cfg.Loadgens {
+		if cfg.Loadgens[i].Name == name {
+			cfg.Loadgens[i].PublicIP = publicIP
+			cfg.Loadgens[i].PrivateIP = privateIP
 			return cfg, nil
 		}
 	}

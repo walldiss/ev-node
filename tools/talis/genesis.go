@@ -166,6 +166,17 @@ func generateCmd() *cobra.Command {
 				}
 			}
 
+			// Stage loadgen payload: evnode-txsim binary + init script
+			// templated with evnode-0's HTTP endpoint as the target.
+			if len(cfg.Loadgens) > 0 {
+				if len(cfg.Evnodes) == 0 {
+					return fmt.Errorf("loadgens configured but no evnodes — at least one ev-node is required")
+				}
+				if err := stageLoadgenPayload(rootDir, payloadDir, buildDirPath, cfg); err != nil {
+					return fmt.Errorf("failed to stage loadgen payload: %w", err)
+				}
+			}
+
 			return cfg.Save(rootDir)
 		},
 	}
@@ -570,6 +581,101 @@ tmux new-session -d -s evnode "evnode \
   2>&1 | tee -a /root/evnode.log"
 
 echo "ev-node started in tmux session 'evnode' — attach with: tmux attach -t evnode"
+`
+	return os.WriteFile(path, []byte(script), 0o755)
+}
+
+// stageLoadgenPayload stages the evnode-txsim binary + a templated
+// init script for each load-gen instance. The script bursts traffic at
+// evnode-0's HTTP /tx endpoint for a fixed duration (override via the
+// TXSIM_DURATION / TXSIM_CONCURRENCY / TXSIM_TX_SIZE env vars on the
+// box). Final TXSIM: line lands in /root/txsim.log.
+func stageLoadgenPayload(rootDir, payloadDir, buildDirPath string, cfg Config) error {
+	lgPayload := filepath.Join(rootDir, "loadgen-payload")
+
+	if err := os.RemoveAll(lgPayload); err != nil {
+		return fmt.Errorf("clean old loadgen-payload: %w", err)
+	}
+	lgBuild := filepath.Join(lgPayload, "build")
+	if err := os.MkdirAll(lgBuild, 0o755); err != nil {
+		return err
+	}
+
+	if buildDirPath == "" {
+		return fmt.Errorf("--build-dir is required when loadgens are configured (must contain `evnode-txsim` binary)")
+	}
+	src := filepath.Join(buildDirPath, "evnode-txsim")
+	if err := copyFile(src, filepath.Join(lgBuild, "evnode-txsim"), 0o755); err != nil {
+		return fmt.Errorf("copy evnode-txsim from build dir: %w", err)
+	}
+	if err := copyFile(filepath.Join(payloadDir, "vars.sh"), filepath.Join(lgPayload, "vars.sh"), 0o755); err != nil {
+		return fmt.Errorf("copy vars.sh: %w", err)
+	}
+
+	evnodeIP := cfg.Evnodes[0].PublicIP
+	if evnodeIP == "" || evnodeIP == "TBD" {
+		return fmt.Errorf("evnode-0 has no public IP yet — run `talis up` before genesis")
+	}
+
+	return writeLoadgenInitScript(filepath.Join(lgPayload, "loadgen_init.sh"), evnodeIP)
+}
+
+// writeLoadgenInitScript writes the per-loadgen init script. evnode-0's
+// HTTP endpoint is templated literally because it's only known after
+// `talis up`. Tunables (duration, concurrency, tx size) come through
+// env vars at start time so a single deploy can drive multiple
+// experiments via SSH-set environment.
+func writeLoadgenInitScript(path string, evnodeIP string) error {
+	script := `#!/bin/bash
+set -euo pipefail
+
+EVNODE_IP="` + evnodeIP + `"
+TARGET="${TXSIM_TARGET:-http://${EVNODE_IP}:7777/tx}"
+DURATION="${TXSIM_DURATION:-30s}"
+CONCURRENCY="${TXSIM_CONCURRENCY:-8}"
+TX_SIZE="${TXSIM_TX_SIZE:-10240}"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install curl chrony tmux --yes -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+systemctl enable chrony
+systemctl start chrony
+
+modprobe tcp_bbr || true
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+cp loadgen-payload/build/evnode-txsim /bin/evnode-txsim
+chmod +x /bin/evnode-txsim
+
+source loadgen-payload/vars.sh
+echo "loadgen bootstrap: target=$TARGET duration=$DURATION concurrency=$CONCURRENCY tx_size=$TX_SIZE chain_id=$CHAIN_ID"
+
+# Wait for ev-node's tx endpoint to come up (it will only start once
+# bridge JWT + fibre keyring are scp'd in by the operator).
+echo "Waiting for $TARGET to accept tx (testing /stats)..."
+STATS_URL="${TARGET%/tx}/stats"
+WAITED=0
+until curl --silent --max-time 2 --output /dev/null "$STATS_URL" 2>/dev/null; do
+  sleep 5
+  WAITED=$((WAITED + 5))
+  if [ $((WAITED % 60)) -eq 0 ]; then
+    echo "  still waiting for ev-node after ${WAITED}s..."
+  fi
+done
+echo "ev-node reachable after ${WAITED}s; starting txsim run"
+
+tmux kill-session -t txsim 2>/dev/null || true
+tmux new-session -d -s txsim "evnode-txsim \
+  --target $TARGET \
+  --duration $DURATION \
+  --concurrency $CONCURRENCY \
+  --tx-size $TX_SIZE \
+  2>&1 | tee -a /root/txsim.log"
+
+echo "txsim started in tmux session 'txsim' — attach with: tmux attach -t txsim"
+echo "Final summary lands at /root/txsim.log; grep TXSIM: for the machine-parseable line"
 `
 	return os.WriteFile(path, []byte(script), 0o755)
 }
