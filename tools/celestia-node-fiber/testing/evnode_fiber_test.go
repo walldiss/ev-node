@@ -259,6 +259,10 @@ func newFiberEvNode(t *testing.T, ctx context.Context, fiberClient block.FiberCl
 	cfg.Node.Aggregator = true
 	cfg.Node.BlockTime = config.DurationWrapper{Duration: evnodeBlockTime}
 	cfg.Node.LazyMode = false
+	// 100 ms scrape keeps the reaper draining the InMem tx channel faster
+	// than producers under load, so blocks don't accumulate >5 MiB of txs
+	// in a single batch and trip the DefaultMaxBlobSize cap.
+	cfg.Node.ScrapeInterval = config.DurationWrapper{Duration: 100 * time.Millisecond}
 	cfg.DA.BlockTime = config.DurationWrapper{Duration: evnodeDABlockTime}
 	cfg.DA.Namespace = evnodeHeaderNS
 	cfg.DA.DataNamespace = evnodeDataNS
