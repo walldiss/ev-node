@@ -23,6 +23,12 @@ const (
 	Observability NodeType = "observability"
 	// Encoder represents a dedicated fibre-txsim encoder node.
 	Encoder NodeType = "encoder"
+
+	// Evnode represents an ev-node aggregator wired to celestia-node-fiber.
+	// Runs the evnode-fibre runner from
+	// tools/celestia-node-fiber/cmd/evnode-fibre. One per experiment in
+	// the smallest topology.
+	Evnode NodeType = "evnode"
 )
 
 var (
@@ -31,6 +37,7 @@ var (
 	lightCount         = atomic.Uint32{}
 	observabilityCount = atomic.Uint32{}
 	encoderCount       = atomic.Uint32{}
+	evnodeCount        = atomic.Uint32{}
 )
 
 // NodeName returns the name of the node based on its type and index. The
@@ -49,6 +56,8 @@ func NodeName(nodeType NodeType) string {
 		index = int(observabilityCount.Add(1)) - 1
 	case Encoder:
 		index = int(encoderCount.Add(1)) - 1
+	case Evnode:
+		index = int(evnodeCount.Add(1)) - 1
 	default:
 		panic(fmt.Sprintf("unknown node type: %s", nodeType))
 	}
@@ -131,7 +140,7 @@ func ExperimentTag(nodeType NodeType, index int, experimentID, chainID string) s
 
 func GetExperimentTag(tags []string) string {
 	for _, tag := range tags {
-		if strings.HasPrefix(tag, "validator-") || strings.HasPrefix(tag, "bridge-") || strings.HasPrefix(tag, "light-") || strings.HasPrefix(tag, "observability-") || strings.HasPrefix(tag, "encoder-") {
+		if strings.HasPrefix(tag, "validator-") || strings.HasPrefix(tag, "bridge-") || strings.HasPrefix(tag, "light-") || strings.HasPrefix(tag, "observability-") || strings.HasPrefix(tag, "encoder-") || strings.HasPrefix(tag, "evnode-") {
 			return tag
 		}
 	}
@@ -145,6 +154,7 @@ type Config struct {
 	Lights        []Instance `json:"lights,omitempty"`
 	Observability []Instance `json:"observability,omitempty"`
 	Encoders      []Instance `json:"encoders,omitempty"`
+	Evnodes       []Instance `json:"evnodes,omitempty"`
 
 	// ChainID is the chain ID of the network. This is used to identify the
 	// network and is also used as the chain ID of the network. It is
@@ -186,6 +196,7 @@ func NewConfig(experiment, chainID string) Config {
 		Lights:        []Instance{},
 		Observability: []Instance{},
 		Encoders:      []Instance{},
+		Evnodes:       []Instance{},
 		Experiment:    experiment,
 		ChainID:       TalisChainID(chainID),
 		S3Config: S3Config{
@@ -310,6 +321,24 @@ func (cfg Config) WithAWSBridge(region string) Config {
 	return cfg
 }
 
+func (cfg Config) WithDigitalOceanEvnode(region string) Config {
+	i := NewDigitalOceanEvnode(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Evnodes = append(cfg.Evnodes, i)
+	return cfg
+}
+
+func (cfg Config) WithGoogleCloudEvnode(region string) Config {
+	i := NewGoogleCloudEvnode(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Evnodes = append(cfg.Evnodes, i)
+	return cfg
+}
+
+func (cfg Config) WithAWSEvnode(region string) Config {
+	i := NewAWSEvnode(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Evnodes = append(cfg.Evnodes, i)
+	return cfg
+}
+
 func (cfg Config) WithChainID(chainID string) Config {
 	cfg.ChainID = TalisChainID(chainID)
 	return cfg
@@ -390,6 +419,13 @@ func (cfg Config) UpdateInstance(name, publicIP, privateIP string) (Config, erro
 		if cfg.Encoders[i].Name == name {
 			cfg.Encoders[i].PublicIP = publicIP
 			cfg.Encoders[i].PrivateIP = privateIP
+			return cfg, nil
+		}
+	}
+	for i := range cfg.Evnodes {
+		if cfg.Evnodes[i].Name == name {
+			cfg.Evnodes[i].PublicIP = publicIP
+			cfg.Evnodes[i].PrivateIP = privateIP
 			return cfg, nil
 		}
 	}

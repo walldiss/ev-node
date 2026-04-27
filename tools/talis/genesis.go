@@ -149,6 +149,23 @@ func generateCmd() *cobra.Command {
 				}
 			}
 
+			// Stage ev-node payload: evnode binary + templated init script.
+			// ev-node needs the bridge JWT + a funded fibre keyring, both
+			// of which are scp'd in a separate `talis fibre-bootstrap-evnode`
+			// step (or by hand) — the init script polls for them and only
+			// starts the daemon once they exist.
+			if len(cfg.Evnodes) > 0 {
+				if len(cfg.Validators) == 0 {
+					return fmt.Errorf("evnodes configured but no validators — bring up validators first")
+				}
+				if len(cfg.Bridges) == 0 {
+					return fmt.Errorf("evnodes configured but no bridges — at least one bridge is required")
+				}
+				if err := stageEvnodePayload(rootDir, payloadDir, buildDirPath, cfg); err != nil {
+					return fmt.Errorf("failed to stage evnode payload: %w", err)
+				}
+			}
+
 			return cfg.Save(rootDir)
 		},
 	}
@@ -425,6 +442,134 @@ tmux new-session -d -s bridge "celestia bridge start \
   --metrics 2>&1 | tee -a /root/bridge.log"
 
 echo "Bridge started in tmux session 'bridge' — attach with: tmux attach -t bridge"
+`
+	return os.WriteFile(path, []byte(script), 0o755)
+}
+
+// stageEvnodePayload copies the evnode-fibre binary + a templated init
+// script into evnode-payload/ so the deploy step can build a small tar
+// per ev-node. The init script poll-waits for /root/bridge-jwt.txt and
+// /root/keyring-fibre/ to exist before starting — both are scp'd in by
+// a separate bootstrap step (or manually) so that JWT + keyring don't
+// need to be embedded in the payload.
+func stageEvnodePayload(rootDir, payloadDir, buildDirPath string, cfg Config) error {
+	evPayload := filepath.Join(rootDir, "evnode-payload")
+
+	if err := os.RemoveAll(evPayload); err != nil {
+		return fmt.Errorf("clean old evnode-payload: %w", err)
+	}
+
+	evBuild := filepath.Join(evPayload, "build")
+	if err := os.MkdirAll(evBuild, 0o755); err != nil {
+		return err
+	}
+
+	if buildDirPath == "" {
+		return fmt.Errorf("--build-dir is required when evnodes are configured (must contain `evnode` binary)")
+	}
+	src := filepath.Join(buildDirPath, "evnode")
+	if err := copyFile(src, filepath.Join(evBuild, "evnode"), 0o755); err != nil {
+		return fmt.Errorf("copy evnode from build dir: %w", err)
+	}
+
+	if err := copyFile(filepath.Join(payloadDir, "vars.sh"), filepath.Join(evPayload, "vars.sh"), 0o755); err != nil {
+		return fmt.Errorf("copy vars.sh: %w", err)
+	}
+
+	bridgeIP := cfg.Bridges[0].PublicIP
+	coreIP := cfg.Validators[0].PublicIP
+	if bridgeIP == "" || bridgeIP == "TBD" {
+		return fmt.Errorf("bridge-0 has no public IP yet — run `talis up` before genesis")
+	}
+	if coreIP == "" || coreIP == "TBD" {
+		return fmt.Errorf("validator-0 has no public IP yet — run `talis up` before genesis")
+	}
+
+	return writeEvnodeInitScript(filepath.Join(evPayload, "evnode_init.sh"), bridgeIP, coreIP)
+}
+
+// writeEvnodeInitScript writes the evnode aggregator init script.
+// Templated values: BRIDGE_IP (bridge-0 RPC for blob.Subscribe / Submit)
+// and CORE_GRPC_ADDR (validator-0 gRPC for state queries via
+// celestia-node's submit path). CHAIN_ID flows through vars.sh.
+//
+// The script does NOT copy bridge-jwt.txt or the fibre keyring itself —
+// those must already exist on the box (manually scp'd or pushed by a
+// future `talis fibre-bootstrap-evnode` command). The poll loop makes
+// the script restartable: re-running deploy after copying the missing
+// pieces will cleanly start the daemon.
+func writeEvnodeInitScript(path string, bridgeIP, coreIP string) error {
+	script := `#!/bin/bash
+set -euo pipefail
+
+EVNODE_HOME="$HOME/.evnode-fibre"
+BRIDGE_ADDR="` + bridgeIP + `:26658"
+CORE_GRPC_ADDR="` + coreIP + `:9090"
+BRIDGE_JWT_FILE="/root/bridge-jwt.txt"
+FIBRE_KEYRING_DIR="/root/keyring-fibre"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install curl jq chrony tmux --yes -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+systemctl enable chrony
+systemctl start chrony
+
+modprobe tcp_bbr || true
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+cp evnode-payload/build/evnode /bin/evnode
+chmod +x /bin/evnode
+
+source evnode-payload/vars.sh
+echo "evnode bootstrap: chain_id=$CHAIN_ID bridge=$BRIDGE_ADDR core=$CORE_GRPC_ADDR"
+
+mkdir -p "$EVNODE_HOME"
+
+# Wait for the operator-supplied dependencies. These come from a
+# separate step (manual scp or 'talis fibre-bootstrap-evnode'):
+#   1. /root/bridge-jwt.txt              admin JWT from the bridge
+#   2. /root/keyring-fibre/keyring-test  cosmos-sdk file keyring with
+#                                        a Fibre payment account
+# Without them the daemon would crash immediately on startup.
+echo "Waiting for $BRIDGE_JWT_FILE and $FIBRE_KEYRING_DIR..."
+WAITED=0
+until [ -s "$BRIDGE_JWT_FILE" ] && [ -d "$FIBRE_KEYRING_DIR/keyring-test" ]; do
+  sleep 5
+  WAITED=$((WAITED + 5))
+  if [ $((WAITED % 60)) -eq 0 ]; then
+    echo "  still waiting after ${WAITED}s..."
+  fi
+done
+echo "Dependencies present after ${WAITED}s"
+
+ufw allow 7777/tcp || true   # tx-ingest HTTP
+ufw allow 7331/tcp || true   # ev-node RPC
+ufw allow 7676/tcp || true   # libp2p (idle when Fiber on)
+
+# A passphrase file keeps the file-signer reproducible across restarts
+# without baking creds into the script.
+mkdir -p "$EVNODE_HOME/.signer"
+if [ ! -f "$EVNODE_HOME/.signer/passphrase" ]; then
+  echo "evnode-fibre-passphrase" > "$EVNODE_HOME/.signer/passphrase"
+  chmod 600 "$EVNODE_HOME/.signer/passphrase"
+fi
+
+tmux kill-session -t evnode 2>/dev/null || true
+tmux new-session -d -s evnode "evnode \
+  --home ${EVNODE_HOME} \
+  --chain-id ${CHAIN_ID} \
+  --bridge-addr ${BRIDGE_ADDR} \
+  --bridge-token-file ${BRIDGE_JWT_FILE} \
+  --core-grpc-addr ${CORE_GRPC_ADDR} \
+  --core-network ${CHAIN_ID} \
+  --keyring-path ${FIBRE_KEYRING_DIR} \
+  --signer-passphrase-file ${EVNODE_HOME}/.signer/passphrase \
+  --log-level info \
+  2>&1 | tee -a /root/evnode.log"
+
+echo "ev-node started in tmux session 'evnode' — attach with: tmux attach -t evnode"
 `
 	return os.WriteFile(path, []byte(script), 0o755)
 }

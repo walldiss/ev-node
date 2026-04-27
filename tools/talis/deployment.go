@@ -136,7 +136,10 @@ func deployCmd() *cobra.Command {
 				if err := deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
 					return err
 				}
-				return deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+				if err := deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+					return err
+				}
+				return deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 			}
 			if err := deployPayloadViaS3(cmd.Context(), rootDir, cfg.Validators, tarPath, SSHKeyPath, "/root", "payload/validator_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
 				if !ignoreFailed {
@@ -150,7 +153,10 @@ func deployCmd() *cobra.Command {
 			if err := deployEncodersIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
 				return err
 			}
-			return deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
+			if err := deployBridgesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers); err != nil {
+				return err
+			}
+			return deployEvnodesIfConfigured(cmd.Context(), cfg, rootDir, SSHKeyPath, directUpload, workers)
 		},
 	}
 
@@ -234,6 +240,43 @@ func deployBridgesIfConfigured(ctx context.Context, cfg Config, rootDir, sshKeyP
 	}
 
 	log.Printf("Bridge deployment complete\n")
+	return nil
+}
+
+// deployEvnodesIfConfigured tars the evnode-payload directory (evnode
+// binary + templated init script) and ships it to each ev-node
+// instance. The init script poll-waits for the bridge JWT + fibre
+// keyring, both scp'd in separately, before starting the daemon.
+func deployEvnodesIfConfigured(ctx context.Context, cfg Config, rootDir, sshKeyPath string, directUpload bool, workers int) error {
+	if len(cfg.Evnodes) == 0 {
+		return nil
+	}
+
+	evPayloadDir := filepath.Join(rootDir, "evnode-payload")
+	if _, err := os.Stat(evPayloadDir); os.IsNotExist(err) {
+		return fmt.Errorf("evnode-payload directory not found — run 'talis genesis' first")
+	}
+
+	evTarPath := filepath.Join(rootDir, "evnode-payload.tar.gz")
+	log.Printf("Compressing evnode payload to %s\n", evTarPath)
+	tarCmd := exec.Command("tar", "-czf", evTarPath, "-C", rootDir, "evnode-payload")
+	tarCmd.Env = append(os.Environ(), "COPYFILE_DISABLE=1")
+	if output, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to compress evnode payload: %w, output: %s", err, string(output))
+	}
+	log.Printf("Sending evnode payload to %d evnode(s)...\n", len(cfg.Evnodes))
+
+	if directUpload {
+		if err := deployPayloadDirect(cfg.Evnodes, evTarPath, sshKeyPath, "/root", "evnode-payload/evnode_init.sh", 7*time.Minute, workers); err != nil {
+			return fmt.Errorf("evnode deployment: %w", err)
+		}
+	} else {
+		if err := deployPayloadViaS3(ctx, rootDir, cfg.Evnodes, evTarPath, sshKeyPath, "/root", "evnode-payload/evnode_init.sh", 7*time.Minute, cfg.S3Config, workers); err != nil {
+			return fmt.Errorf("evnode deployment: %w", err)
+		}
+	}
+
+	log.Printf("evnode deployment complete (init script will poll-wait for bridge JWT + fibre keyring on each box)\n")
 	return nil
 }
 

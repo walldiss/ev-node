@@ -18,6 +18,7 @@ const (
 	DODefaultValidatorSlug     = "c2-16vcpu-32gb"
 	DODefaultEncoderSlug       = "c2-8vcpu-16gb"
 	DODefaultBridgeSlug        = "c2-8vcpu-16gb"
+	DODefaultEvnodeSlug        = "c2-8vcpu-16gb"
 	DODefaultObservabilitySlug = "s-2vcpu-4gb"
 	DODefaultImage             = "ubuntu-24-04-x64"
 	RandomRegion               = "random"
@@ -70,6 +71,17 @@ func NewDigitalOceanBridge(region string) Instance {
 	i := NewBaseInstance(Bridge)
 	i.Provider = DigitalOcean
 	i.Slug = DODefaultBridgeSlug
+	i.Region = region
+	return i
+}
+
+func NewDigitalOceanEvnode(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomDORegion()
+	}
+	i := NewBaseInstance(Evnode)
+	i.Provider = DigitalOcean
+	i.Slug = DODefaultEvnodeSlug
 	i.Region = region
 	return i
 }

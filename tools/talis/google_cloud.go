@@ -20,6 +20,7 @@ const (
 	GCDefaultValidatorMachineType     = "c3d-highcpu-16"
 	GCDefaultEncoderMachineType       = "c3d-highcpu-8"
 	GCDefaultBridgeMachineType        = "c3d-highcpu-8"
+	GCDefaultEvnodeMachineType        = "c3d-highcpu-8"
 	GCDefaultObservabilityMachineType = "e2-medium"
 	GCDefaultImage                    = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
 	GCDefaultDiskSizeGB               = 400
@@ -75,7 +76,7 @@ func NewGCClient(cfg Config) (*GCClient, error) {
 
 func (c *GCClient) Up(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...)
+	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
 	for _, v := range allInstances {
 		if v.Provider != GoogleCloud {
 			continue
@@ -115,7 +116,7 @@ func (c *GCClient) Up(ctx context.Context, workers int) error {
 
 func (c *GCClient) Down(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...)
+	allInstances := append(append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...), c.cfg.Evnodes...)
 	for _, v := range allInstances {
 		if v.Provider != GoogleCloud {
 			continue
@@ -244,6 +245,17 @@ func NewGoogleCloudBridge(region string) Instance {
 	i := NewBaseInstance(Bridge)
 	i.Provider = GoogleCloud
 	i.Slug = GCDefaultBridgeMachineType
+	i.Region = region
+	return i
+}
+
+func NewGoogleCloudEvnode(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomGCRegion()
+	}
+	i := NewBaseInstance(Evnode)
+	i.Provider = GoogleCloud
+	i.Slug = GCDefaultEvnodeMachineType
 	i.Region = region
 	return i
 }
