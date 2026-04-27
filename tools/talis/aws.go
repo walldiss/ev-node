@@ -26,7 +26,11 @@ const (
 	AWSDefaultValidatorInstanceType = "c6in.4xlarge"
 	// c6in.2xlarge: 8 vCPU / 16 GiB — encoders submit blobs via gRPC and
 	// don't need the full validator footprint.
-	AWSDefaultEncoderInstanceType       = "c6in.2xlarge"
+	AWSDefaultEncoderInstanceType = "c6in.2xlarge"
+	// Bridge nodes are network-bound (relay headers / blob events from
+	// validators to ev-node). c6in.2xlarge gives the same 25 Gbps as
+	// the validators while halving CPU.
+	AWSDefaultBridgeInstanceType        = "c6in.2xlarge"
 	AWSDefaultObservabilityInstanceType = "t3.medium"
 	AWSDefaultRootVolumeGB              = int32(400)
 
@@ -92,7 +96,7 @@ func (c *AWSClient) Up(ctx context.Context, workers int) error {
 	}
 
 	insts := make([]Instance, 0)
-	allInstances := append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...)
+	allInstances := append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...)
 	for _, v := range allInstances {
 		if v.Provider != AWS {
 			continue
@@ -127,7 +131,7 @@ func (c *AWSClient) Up(ctx context.Context, workers int) error {
 
 func (c *AWSClient) Down(ctx context.Context, workers int) error {
 	insts := make([]Instance, 0)
-	allInstances := append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...)
+	allInstances := append(append(append(c.cfg.Validators, c.cfg.Observability...), c.cfg.Encoders...), c.cfg.Bridges...)
 	for _, v := range allInstances {
 		if v.Provider != AWS {
 			continue
@@ -203,6 +207,17 @@ func NewAWSEncoder(region string) Instance {
 	i := NewBaseInstance(Encoder)
 	i.Provider = AWS
 	i.Slug = AWSDefaultEncoderInstanceType
+	i.Region = region
+	return i
+}
+
+func NewAWSBridge(region string) Instance {
+	if region == "" || region == RandomRegion {
+		region = RandomAWSRegion()
+	}
+	i := NewBaseInstance(Bridge)
+	i.Provider = AWS
+	i.Slug = AWSDefaultBridgeInstanceType
 	i.Region = region
 	return i
 }

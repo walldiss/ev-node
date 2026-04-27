@@ -292,6 +292,24 @@ func (cfg Config) WithAWSEncoder(region string) Config {
 	return cfg
 }
 
+func (cfg Config) WithDigitalOceanBridge(region string) Config {
+	i := NewDigitalOceanBridge(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Bridges = append(cfg.Bridges, i)
+	return cfg
+}
+
+func (cfg Config) WithGoogleCloudBridge(region string) Config {
+	i := NewGoogleCloudBridge(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Bridges = append(cfg.Bridges, i)
+	return cfg
+}
+
+func (cfg Config) WithAWSBridge(region string) Config {
+	i := NewAWSBridge(region).WithExperiment(cfg.Experiment, cfg.ChainID)
+	cfg.Bridges = append(cfg.Bridges, i)
+	return cfg
+}
+
 func (cfg Config) WithChainID(chainID string) Config {
 	cfg.ChainID = TalisChainID(chainID)
 	return cfg

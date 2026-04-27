@@ -62,8 +62,20 @@ func addCmd() *cobra.Command {
 				}
 				applySlug(cfg.Encoders, start, slug)
 			case "bridge":
-				log.Println("bridges are not yet supported")
-				return nil
+				start := len(cfg.Bridges)
+				for range count {
+					switch provider {
+					case "digitalocean":
+						cfg = cfg.WithDigitalOceanBridge(region)
+					case "googlecloud":
+						cfg = cfg.WithGoogleCloudBridge(region)
+					case "aws":
+						cfg = cfg.WithAWSBridge(region)
+					default:
+						return fmt.Errorf("unknown provider %q (supported: digitalocean, googlecloud, aws)", provider)
+					}
+				}
+				applySlug(cfg.Bridges, start, slug)
 			case "light":
 				log.Println("light nodes are not yet supported")
 				return nil
